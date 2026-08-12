@@ -41,6 +41,14 @@ MANOR_KEYWORDS = [
     "30 jaehrige",
 ]
 
+# --- Ryu.land (30th Celebration collection + new related collections/products) ---
+RYU_SEEN = ROOT / "seen_ryu.json"
+RYU_COLLECTION = "30th-30th-celebration"
+RYU_COLLECTION_URL = (
+    f"https://ryu.land/collections/{RYU_COLLECTION}/products.json"
+)
+RYU_COLLECTIONS_JSON = "https://ryu.land/collections.json"
+
 # --- Brack (notify only on keyword matches via public sitemaps) ---
 BRACK_SEEN = ROOT / "seen_brack.json"
 BRACK_STATE = ROOT / "brack_sitemap_state.json"
@@ -442,6 +450,262 @@ def check_manor() -> None:
     )
 
 
+# ----- Ryu.land -----
+
+
+def _ryu_get_json(url: str) -> dict | list:
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.load(resp)
+
+
+def _ryu_fetch_all_collections() -> list[dict]:
+    cols: list[dict] = []
+    page = 1
+    while page <= 20:
+        data = _ryu_get_json(
+            f"{RYU_COLLECTIONS_JSON}?limit=250&page={page}"
+        )
+        chunk = data.get("collections", []) if isinstance(data, dict) else []
+        if not chunk:
+            break
+        cols.extend(chunk)
+        if len(chunk) < 250:
+            break
+        page += 1
+    return cols
+
+
+def _ryu_is_interesting_collection(handle: str, title: str) -> bool:
+    blob = f"{handle} {title}".casefold()
+    if "30th" in blob and ("celebrat" in blob or "annivers" in blob):
+        return True
+    if "pokemon" in blob and ("pre-order" in blob or "preorder" in blob):
+        return True
+    if "pkm" in blob and ("pre-order" in blob or "preorder" in blob):
+        return True
+    return False
+
+
+def _ryu_collection_products(handle: str) -> list[dict]:
+    data = _ryu_get_json(
+        f"https://ryu.land/collections/{handle}/products.json?limit=250"
+    )
+    products = []
+    for p in data.get("products", []):
+        variants = []
+        for v in p.get("variants", []):
+            variants.append(
+                {
+                    "id": str(v.get("id")),
+                    "title": v.get("title") or "",
+                    "available": bool(v.get("available")),
+                    "price": v.get("price"),
+                }
+            )
+        products.append(
+            {
+                "id": str(p.get("id")),
+                "title": p.get("title") or "",
+                "handle": p.get("handle") or "",
+                "url": f"https://ryu.land/products/{p.get('handle')}",
+                "tags": p.get("tags") or [],
+                "variants": variants,
+            }
+        )
+    return products
+
+
+def _ryu_search_30th_products() -> list[dict]:
+    """Catch 30th products even if not yet filed under the main collection."""
+    q = urllib.parse.urlencode(
+        {
+            "q": "30th",
+            "resources[type]": "product",
+            "resources[limit]": "10",
+            "resources[options][unavailable_products]": "last",
+        }
+    )
+    data = _ryu_get_json(f"https://ryu.land/search/suggest.json?{q}")
+    results = (
+        ((data.get("resources") or {}).get("results") or {}).get("products") or []
+    )
+    out = []
+    for p in results:
+        title = p.get("title") or ""
+        tags = [str(t).casefold() for t in (p.get("tags") or [])]
+        blob = f"{title} {' '.join(tags)}".casefold()
+        if "30th" not in blob:
+            continue
+        if not any(k in blob for k in ("pokemon", "pokémon", "pkm")):
+            continue
+        handle = p.get("handle") or ""
+        out.append(
+            {
+                "id": str(p.get("id")),
+                "title": title,
+                "handle": handle,
+                "url": f"https://ryu.land/products/{handle}",
+                "tags": p.get("tags") or [],
+                "available": bool(p.get("available")),
+            }
+        )
+    return out
+
+
+def check_ryu() -> None:
+    raw: dict = {
+        "product_ids": [],
+        "collection_handles": [],
+        "variant_availability": {},
+        "initialized": False,
+    }
+    if RYU_SEEN.exists():
+        raw = json.loads(RYU_SEEN.read_text(encoding="utf-8"))
+
+    seen_products = {str(x) for x in raw.get("product_ids", [])}
+    seen_collections = {str(x) for x in raw.get("collection_handles", [])}
+    prev_variants: dict = raw.get("variant_availability") or {}
+    initialized = bool(raw.get("initialized"))
+
+    # 1) Known 30th collection products
+    collection_products = _ryu_collection_products(RYU_COLLECTION)
+    print(
+        f"[Ryu] Collection {RYU_COLLECTION}: {len(collection_products)} Produkte"
+    )
+
+    # 2) Search fallback for other 30th Pokémon products
+    search_products = _ryu_search_30th_products()
+    print(f"[Ryu] Search 30th Pokémon: {len(search_products)} Treffer")
+
+    by_id: dict[str, dict] = {}
+    for p in collection_products + search_products:
+        by_id[p["id"]] = p
+
+    # 3) Watch for new related collections (pokemon pre-order / 30th)
+    all_cols = _ryu_fetch_all_collections()
+    interesting_cols = [
+        c
+        for c in all_cols
+        if _ryu_is_interesting_collection(c.get("handle", ""), c.get("title", ""))
+    ]
+    print(f"[Ryu] Interessante Collections: {len(interesting_cols)}")
+    for c in interesting_cols:
+        print(f"  · {c.get('handle')} ({c.get('products_count')})")
+
+    current_col_handles = {c.get("handle") for c in interesting_cols if c.get("handle")}
+    current_product_ids = set(by_id)
+    current_variants: dict[str, bool] = {}
+    for p in collection_products:
+        for v in p.get("variants", []):
+            current_variants[v["id"]] = bool(v["available"])
+
+    if not initialized:
+        RYU_SEEN.write_text(
+            json.dumps(
+                {
+                    "product_ids": sorted(current_product_ids),
+                    "collection_handles": sorted(current_col_handles),
+                    "variant_availability": current_variants,
+                    "initialized": True,
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        print("[Ryu] Erster Lauf: State gespeichert, keine Mail.")
+        return
+
+    new_products = [by_id[i] for i in current_product_ids if i not in seen_products]
+    new_collections = [
+        c
+        for c in interesting_cols
+        if c.get("handle") and c.get("handle") not in seen_collections
+    ]
+    newly_available_variants: list[tuple[dict, dict]] = []
+    for p in collection_products:
+        for v in p.get("variants", []):
+            vid = v["id"]
+            was = prev_variants.get(vid)
+            if was is False and v["available"] is True:
+                newly_available_variants.append((p, v))
+
+    alerts: list[str] = []
+    if new_collections:
+        alerts.append("Neue Collection(s):")
+        for c in new_collections:
+            handle = c.get("handle")
+            alerts.append(f"- {c.get('title')} ({c.get('products_count')} Produkte)")
+            alerts.append(f"  https://ryu.land/collections/{handle}")
+            alerts.append("")
+
+    if new_products:
+        alerts.append("Neue 30th-Produkte:")
+        for p in new_products:
+            alerts.append(f"- {p['title']}")
+            alerts.append(f"  {p['url']}")
+            alerts.append("")
+
+    if newly_available_variants:
+        alerts.append("Variante jetzt vorbestellbar/verfügbar:")
+        for p, v in newly_available_variants:
+            alerts.append(f"- {p['title']} — {v['title']}")
+            alerts.append(f"  {p['url']}")
+            alerts.append("")
+
+    if alerts:
+        subject_bits = []
+        if new_collections:
+            subject_bits.append(f"{len(new_collections)} Collection")
+        if new_products:
+            subject_bits.append(f"{len(new_products)} Produkt")
+        if newly_available_variants:
+            subject_bits.append(f"{len(newly_available_variants)} Variante")
+        subject = "🐉 Ryu.land: " + ", ".join(subject_bits) + " neu"
+        if new_products:
+            subject = f"🐉 Ryu.land: {new_products[0]['title']}"
+            if len(new_products) + len(new_collections) + len(
+                newly_available_variants
+            ) > 1:
+                subject += " (+weitere)"
+        elif newly_available_variants:
+            p, v = newly_available_variants[0]
+            subject = f"🐉 Ryu.land verfügbar: {p['title']} ({v['title']})"
+
+        body = "\n".join(
+            [
+                "Update bei ryu.land (30th / Pre-Order Monitoring):",
+                f"https://ryu.land/collections/{RYU_COLLECTION}",
+                "",
+                *alerts,
+            ]
+        )
+        send_email(subject, body)
+        print("[Ryu] Mail gesendet.")
+    else:
+        print("[Ryu] Keine neuen Pre-Order/30th-Änderungen.")
+
+    RYU_SEEN.write_text(
+        json.dumps(
+            {
+                "product_ids": sorted(seen_products | current_product_ids),
+                "collection_handles": sorted(seen_collections | current_col_handles),
+                "variant_availability": {
+                    **prev_variants,
+                    **current_variants,
+                },
+                "initialized": True,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 # ----- Brack -----
 
 
@@ -614,6 +878,11 @@ def main() -> None:
         check_manor()
     except Exception as exc:  # noqa: BLE001
         print(f"[Manor] FEHLER: {exc}")
+
+    try:
+        check_ryu()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[Ryu] FEHLER: {exc}")
 
     # Brack is often blocked from GitHub cloud — only run when forced.
     if FORCE_BRACK_SCAN:
