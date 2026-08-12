@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Monitor Cardmaniac + Brack and email on matching new products."""
+"""Monitor Cardmaniac, CardCollectors stock, and Brack."""
 
 from __future__ import annotations
 
 import hashlib
+import html as html_lib
 import json
 import os
 import re
@@ -21,6 +22,11 @@ ROOT = Path(__file__).resolve().parent
 CARDMANIAC_URL = "https://cardmaniac.ch/collections/pre-order/products.json"
 CARDMANIAC_PAGE = "https://cardmaniac.ch/collections/pre-order"
 CARDMANIAC_SEEN = ROOT / "seen.json"
+
+# --- CardCollectors (notify when watched products become in stock) ---
+CARDCOLLECTORS_WATCHLIST = ROOT / "watchlist_cardcollectors.json"
+CARDCOLLECTORS_STOCK = ROOT / "stock_cardcollectors.json"
+CARDCOLLECTORS_API = "https://cardcollectors.ch/wp-json/wc/store/v1/products"
 
 # --- Brack (notify only on keyword matches via public sitemaps) ---
 BRACK_SEEN = ROOT / "seen_brack.json"
@@ -188,6 +194,97 @@ def check_cardmaniac() -> None:
     save_seen(CARDMANIAC_SEEN, current_ids)
 
 
+# ----- CardCollectors (stock watch) -----
+
+
+def _slug_from_url(url: str) -> str:
+    return urllib.parse.urlparse(url).path.rstrip("/").rsplit("/", 1)[-1]
+
+
+def fetch_cardcollectors_product(slug: str) -> dict | None:
+    api = f"{CARDCOLLECTORS_API}?slug={urllib.parse.quote(slug)}"
+    req = urllib.request.Request(api, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.load(resp)
+    if not data:
+        return None
+    p = data[0]
+    return {
+        "id": str(p["id"]),
+        "slug": slug,
+        "title": html_lib.unescape(p.get("name") or slug),
+        "url": p.get("permalink") or f"https://cardcollectors.ch/produkt/{slug}/",
+        "in_stock": bool(p.get("is_in_stock")),
+    }
+
+
+def check_cardcollectors() -> None:
+    if not CARDCOLLECTORS_WATCHLIST.exists():
+        print("[CardCollectors] Keine watchlist_cardcollectors.json — übersprungen.")
+        return
+
+    urls = json.loads(CARDCOLLECTORS_WATCHLIST.read_text(encoding="utf-8"))
+    prev = {}
+    if CARDCOLLECTORS_STOCK.exists():
+        prev = json.loads(CARDCOLLECTORS_STOCK.read_text(encoding="utf-8")).get(
+            "stock", {}
+        )
+
+    print(f"[CardCollectors] Prüfe {len(urls)} Produkte…")
+    now: dict[str, bool] = {}
+    became_available: list[dict] = []
+
+    for url in urls:
+        slug = _slug_from_url(url)
+        try:
+            product = fetch_cardcollectors_product(slug)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[CardCollectors] Fehler bei {slug}: {exc}")
+            if slug in prev:
+                now[slug] = bool(prev[slug])
+            continue
+
+        if not product:
+            print(f"[CardCollectors] Nicht gefunden: {slug}")
+            continue
+
+        in_stock = product["in_stock"]
+        now[slug] = in_stock
+        status = "In den Warenkorb" if in_stock else "Nicht vorrätig"
+        print(f"  · {status}: {product['title']}")
+
+        was = prev.get(slug)
+        # First time we see this slug: seed only, no mail
+        if was is None:
+            continue
+        if in_stock and not was:
+            became_available.append(product)
+
+    if became_available:
+        if len(became_available) == 1:
+            subject = f"🛒 CardCollectors VERFÜGBAR: {became_available[0]['title']}"
+        else:
+            subject = (
+                f"🛒 CardCollectors: {len(became_available)} Produkte jetzt verfügbar"
+            )
+        lines = [
+            "Diese Produkte sind jetzt verfügbar (In den Warenkorb):",
+            "",
+        ]
+        for p in became_available:
+            lines.append(f"- {p['title']}")
+            lines.append(f"  {p['url']}")
+            lines.append("")
+        send_email(subject, "\n".join(lines))
+    else:
+        print("[CardCollectors] Keine neuen Verfügbarkeiten.")
+
+    CARDCOLLECTORS_STOCK.write_text(
+        json.dumps({"stock": now}, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+
 # ----- Brack -----
 
 
@@ -350,10 +447,20 @@ def check_brack() -> None:
 
 def main() -> None:
     check_cardmaniac()
+
     try:
-        check_brack()
+        check_cardcollectors()
     except Exception as exc:  # noqa: BLE001
-        print(f"[Brack] FEHLER (Cardmaniac läuft trotzdem weiter): {exc}")
+        print(f"[CardCollectors] FEHLER: {exc}")
+
+    # Brack is often blocked from GitHub cloud — only run when forced.
+    if FORCE_BRACK_SCAN:
+        try:
+            check_brack()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[Brack] FEHLER: {exc}")
+    else:
+        print("[Brack] Übersprungen (nur bei FORCE_BRACK_SCAN=1).")
 
 
 if __name__ == "__main__":
