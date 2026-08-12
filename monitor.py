@@ -189,6 +189,28 @@ BRACK_URL_KEYWORDS = [
 
 
 def _http_get(url: str, headers: dict[str, str], timeout: int = 45) -> str:
+    """Fetch URL; prefer curl (more reliable from GitHub Actions vs some CDNs)."""
+    import subprocess
+
+    cmd = [
+        "curl",
+        "-sL",
+        "--fail",
+        "--max-time",
+        str(timeout),
+        "-A",
+        headers.get("User-Agent", UA),
+    ]
+    for key, value in headers.items():
+        if key.lower() == "user-agent":
+            continue
+        cmd.extend(["-H", f"{key}: {value}"])
+    cmd.append(url)
+    result = subprocess.run(cmd, capture_output=True, check=False)
+    if result.returncode == 0 and result.stdout:
+        return result.stdout.decode("utf-8", errors="ignore")
+
+    # Fallback to urllib
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read().decode("utf-8", errors="ignore")
@@ -235,17 +257,24 @@ def fetch_brack_sitemap_urls() -> list[str]:
     urls: list[str] = []
 
     def load_one(sm_url: str) -> list[str]:
-        xml = _http_get(sm_url, headers=headers, timeout=60)
+        xml = _http_get(sm_url, headers=headers, timeout=45)
         return re.findall(r"<loc>([^<]+)</loc>", xml)
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    ok = 0
+    with ThreadPoolExecutor(max_workers=6) as pool:
         futures = {pool.submit(load_one, u): u for u in sitemap_urls}
         for fut in as_completed(futures):
             sm_url = futures[fut]
             try:
-                urls.extend(fut.result())
+                found = fut.result()
+                urls.extend(found)
+                ok += 1
             except Exception as exc:  # noqa: BLE001
                 print(f"[Brack] Sitemap übersprungen ({sm_url}): {exc}")
+
+    if ok == 0:
+        raise RuntimeError("Keine Product-Sitemap konnte geladen werden")
+    print(f"[Brack] {ok}/{len(sitemap_urls)} Sitemaps geladen, {len(urls)} URLs")
     return urls
 
 
