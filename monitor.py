@@ -3,15 +3,14 @@
 
 from __future__ import annotations
 
-import http.cookiejar
 import json
 import os
 import re
 import smtplib
 import ssl
-import time
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.message import EmailMessage
 from pathlib import Path
 
@@ -22,26 +21,8 @@ CARDMANIAC_URL = "https://cardmaniac.ch/collections/pre-order/products.json"
 CARDMANIAC_PAGE = "https://cardmaniac.ch/collections/pre-order"
 CARDMANIAC_SEEN = ROOT / "seen.json"
 
-# --- Brack (notify only on keyword matches) ---
-BRACK_PAGE = (
-    "https://www.brack.ch/sport-freizeit/spielwaren/puzzles-spiele/spiele/sammelkarten"
-    "?filter%5BfacetManufacturerName%5D="
-    + urllib.parse.quote("The Pokémon Company")
-)
+# --- Brack (notify only on keyword matches via public sitemaps) ---
 BRACK_SEEN = ROOT / "seen_brack.json"
-
-BRACK_KEYWORDS = [
-    "30th celebration",
-    "30th",
-    "30 jahre",
-    "30-jahre",
-    "30jährigen",
-    "30-jährigen",
-    "tech-sticker",
-    "tech sticker",
-    "sticker-kollektion",
-    "sticker kollektion",
-]
 
 # Highlight these on Cardmaniac (still notifies on all new products there)
 CARDMANIAC_PRIORITY_KEYWORDS = [
@@ -188,12 +169,23 @@ def check_cardmaniac() -> None:
     save_seen(CARDMANIAC_SEEN, current_ids)
 
 
-# ----- Brack -----
+# ----- Brack (via public Google product sitemaps — works on GitHub Actions) -----
 
+BRACK_SITEMAP_INDEX = (
+    "https://www.brack.ch/exports/google/brack.ch/de/sitemap-index.xml"
+)
 
-def _brack_opener() -> urllib.request.OpenerDirector:
-    jar = http.cookiejar.CookieJar()
-    return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+# Match against URL slug (lowercase). Keep specific to avoid false positives.
+BRACK_URL_KEYWORDS = [
+    "30th",
+    "30-jahre",
+    "30jahre",
+    "30-jaehrige",
+    "tech-sticker",
+    "techsticker",
+    "sticker-kollektion",
+    "stickerkollektion",
+]
 
 
 def _http_get(url: str, headers: dict[str, str], timeout: int = 45) -> str:
@@ -202,176 +194,91 @@ def _http_get(url: str, headers: dict[str, str], timeout: int = 45) -> str:
         return resp.read().decode("utf-8", errors="ignore")
 
 
-def _curl_get(url: str, headers: dict[str, str], timeout: int = 90) -> str:
-    """Use curl when sites block Python's TLS fingerprint (common with CDNs)."""
-    import subprocess
-
-    cmd = [
-        "curl",
-        "-sL",
-        "--max-time",
-        str(timeout),
-        "-A",
-        headers.get("User-Agent", UA),
-    ]
-    for key, value in headers.items():
-        if key.lower() == "user-agent":
-            continue
-        cmd.extend(["-H", f"{key}: {value}"])
-    cmd.append(url)
-    result = subprocess.run(cmd, capture_output=True, check=False)
-    if result.returncode != 0:
-        err = result.stderr.decode("utf-8", errors="ignore")[:200]
-        raise RuntimeError(f"curl failed ({result.returncode}): {err}")
-    return result.stdout.decode("utf-8", errors="ignore")
+def _slug_title(url: str) -> str:
+    path = urllib.parse.urlparse(url).path.strip("/")
+    # e.g. the-pokemon-company-pokemon-lumiose-city-mini-tin-en-2111867
+    parts = path.split("-")
+    if parts and parts[-1].isdigit():
+        parts = parts[:-1]
+    if parts[:3] == ["the", "pokemon", "company"]:
+        parts = parts[3:]
+    title = " ".join(parts).strip()
+    return title[:1].upper() + title[1:] if title else path
 
 
-def _brack_get(opener: urllib.request.OpenerDirector, url: str, timeout: int = 45) -> str:
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": UA,
-            "Accept": "text/html,application/xhtml+xml",
-            "Accept-Language": "de-CH,de;q=0.9,en;q=0.8",
-            "Referer": "https://www.brack.ch/",
-        },
+def _is_pokemon_url(url: str) -> bool:
+    low = url.casefold()
+    return "the-pokemon-company" in low or "pokemon" in low or "pokémon" in low
+
+
+def _url_matches_keywords(url: str) -> bool:
+    low = url.casefold()
+    return any(k in low for k in BRACK_URL_KEYWORDS)
+
+
+def fetch_brack_sitemap_urls() -> list[str]:
+    index_xml = _http_get(
+        BRACK_SITEMAP_INDEX,
+        headers={"User-Agent": UA, "Accept": "application/xml,text/xml,*/*"},
+        timeout=60,
     )
-    with opener.open(req, timeout=timeout) as resp:
-        return resp.read().decode("utf-8", errors="ignore")
+    sitemap_urls = [
+        u
+        for u in re.findall(r"<loc>([^<]+)</loc>", index_xml)
+        if "google-product-sitemap-" in u
+    ]
+    if not sitemap_urls:
+        raise RuntimeError("Keine Product-Sitemaps im Index gefunden")
 
+    print(f"[Brack] Lade {len(sitemap_urls)} Product-Sitemaps…")
+    headers = {"User-Agent": UA, "Accept": "application/xml,text/xml,*/*"}
+    urls: list[str] = []
 
-def fetch_brack_via_jina() -> list[dict]:
-    """Fallback: fetch rendered HTML through r.jina.ai (works from cloud IPs)."""
-    proxy_url = "https://r.jina.ai/" + BRACK_PAGE
-    headers = {
-        "User-Agent": UA,
-        "Accept": "text/html",
-        "X-Return-Format": "html",
-    }
-    # Prefer curl: Jina/Akamai often block Python urllib TLS fingerprint.
-    try:
-        html = _curl_get(proxy_url, headers=headers, timeout=90)
-    except Exception as curl_exc:  # noqa: BLE001
-        print(f"[Brack] curl-Proxy fehlgeschlagen ({curl_exc}), versuche urllib…")
-        html = _http_get(proxy_url, headers=headers, timeout=90)
-    products = parse_brack_products(html)
-    if not products:
-        raise RuntimeError("Jina-Fallback lieferte keine Produkte")
-    return products
+    def load_one(sm_url: str) -> list[str]:
+        xml = _http_get(sm_url, headers=headers, timeout=60)
+        return re.findall(r"<loc>([^<]+)</loc>", xml)
 
-
-def fetch_brack_pokemon(retries: int = 1) -> list[dict]:
-    last_err: Exception | None = None
-
-    # 1) Direct fetch (works from home networks; often blocked from cloud)
-    for attempt in range(1, retries + 1):
-        try:
-            opener = _brack_opener()
-            _brack_get(opener, "https://www.brack.ch/", timeout=20)
-            html = _brack_get(opener, BRACK_PAGE, timeout=25)
-            products = parse_brack_products(html)
-            if products:
-                return products
-            raise RuntimeError("Seite geladen, aber keine Produkte gefunden")
-        except Exception as exc:  # noqa: BLE001 - network/Akamai flakiness
-            last_err = exc
-            print(f"[Brack] Direktversuch {attempt}/{retries} fehlgeschlagen: {exc}")
-
-    # 2) Cloud-friendly proxy (needed on GitHub Actions)
-    try:
-        print("[Brack] Nutze Jina-Proxy-Fallback…")
-        return fetch_brack_via_jina()
-    except Exception as exc:  # noqa: BLE001
-        last_err = exc
-        print(f"[Brack] Jina-Fallback fehlgeschlagen: {exc}")
-
-    raise RuntimeError(f"Brack konnte nicht geladen werden: {last_err}")
-
-
-def parse_brack_products(html: str) -> list[dict]:
-    """Parse Pokémon products from Brack category HTML (productDataMap)."""
-    items: dict[str, dict] = {}
-
-    # Prefer structured productDataMap JSON blob if present
-    m = re.search(r'\{"productDataMap":\{', html)
-    if m:
-        # Brace-match the outer object starting at m.start()
-        start = m.start()
-        depth = 0
-        end = None
-        for i, ch in enumerate(html[start:], start):
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    end = i + 1
-                    break
-        if end:
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(load_one, u): u for u in sitemap_urls}
+        for fut in as_completed(futures):
+            sm_url = futures[fut]
             try:
-                blob = json.loads(html[start:end])
-                pdata = blob.get("productDataMap") or {}
-                for sku, entry in pdata.items():
-                    title = (
-                        (entry.get("description") or {}).get("nameWithoutManufacturer")
-                        or entry.get("name")
-                        or "(ohne Titel)"
-                    )
-                    path = entry.get("url") or f"/product-{sku}"
-                    if not path.startswith("http"):
-                        path = "https://www.brack.ch" + path
-                    items[str(sku)] = {
-                        "id": str(sku),
-                        "title": title,
-                        "url": path,
-                        "shop": "Brack",
-                    }
-            except json.JSONDecodeError:
-                items = {}
+                urls.extend(fut.result())
+            except Exception as exc:  # noqa: BLE001
+                print(f"[Brack] Sitemap übersprungen ({sm_url}): {exc}")
+    return urls
 
-    # Fallback: url + nearby nameWithoutManufacturer
-    if not items:
-        for um in re.finditer(r'"url"\s*:\s*"(/the-pokemon-company-[^"]+)"', html):
-            path = um.group(1)
-            ahead = html[um.end() : um.end() + 2500]
-            nm = re.search(
-                r'"nameWithoutManufacturer"\s*:\s*"((?:\\.|[^"\\])*)"', ahead
-            )
-            if not nm:
-                continue
-            name = nm.group(1)
-            sku = path.rsplit("-", 1)[-1]
-            items[sku] = {
-                "id": sku,
-                "title": name,
-                "url": "https://www.brack.ch" + path,
+
+def fetch_brack_keyword_products() -> list[dict]:
+    all_urls = fetch_brack_sitemap_urls()
+    products: list[dict] = []
+    for url in all_urls:
+        if not _is_pokemon_url(url):
+            continue
+        if not _url_matches_keywords(url):
+            continue
+        sku = url.rstrip("/").rsplit("-", 1)[-1]
+        products.append(
+            {
+                "id": sku if sku.isdigit() else url,
+                "title": _slug_title(url),
+                "url": url,
                 "shop": "Brack",
             }
-
-    return list(items.values())
+        )
+    # de-dupe by id
+    by_id = {p["id"]: p for p in products}
+    return list(by_id.values())
 
 
 def check_brack() -> None:
-    products = fetch_brack_pokemon()
-    print(f"[Brack] Gefunden: {len(products)} Pokémon-Produkte")
-
-    matching = [p for p in products if matches_keywords(p["title"], BRACK_KEYWORDS)]
-    print(f"[Brack] Keyword-Treffer jetzt: {len(matching)}")
+    matching = fetch_brack_keyword_products()
+    print(f"[Brack] Keyword-Treffer in Sitemap: {len(matching)}")
     for p in matching:
         print(f"  · {p['title']}")
 
     seen = load_seen(BRACK_SEEN)
     match_ids = {p["id"] for p in matching}
-
-    if not seen and matching:
-        # Seed current matches so we don't spam on first deploy
-        save_seen(BRACK_SEEN, match_ids)
-        print("[Brack] Erster Lauf: seen_brack.json mit aktuellen Treffern initialisiert.")
-        return
-    if not seen:
-        save_seen(BRACK_SEEN, set())
-        print("[Brack] Erster Lauf: keine Keyword-Treffer, seen_brack.json leer initialisiert.")
-        return
 
     new_matches = [p for p in matching if p["id"] not in seen]
     if new_matches:
@@ -385,8 +292,8 @@ def check_brack() -> None:
             subject = f"🛒 Brack: {len(new_matches)} neue 30th/Celebration-Treffer"
 
         lines = [
-            "Neue Treffer bei Brack (Suchbegriffe: 30th Celebration / 30 Jahre / Tech-Sticker):",
-            "https://www.brack.ch/pokemon",
+            "Neue Treffer bei Brack (30th / 30 Jahre / Tech-Sticker):",
+            "https://www.brack.ch/",
             "",
         ]
         for p in new_matches:
@@ -397,8 +304,6 @@ def check_brack() -> None:
     else:
         print("[Brack] Keine neuen Keyword-Treffer.")
 
-    # Remember all matches we've ever notified about (don't drop old ones,
-    # otherwise a temporary catalog glitch would re-notify).
     save_seen(BRACK_SEEN, seen | match_ids)
 
 

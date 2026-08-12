@@ -1,23 +1,20 @@
 # Cardmaniac + Brack Monitor
 
-Läuft alle **~10 Minuten** auf **GitHub Actions** (Cloud) und mailt an **mab151204@gmail.com**.
+Läuft alle **~10 Minuten** auf **GitHub Actions** und mailt an **mab151204@gmail.com**.
 
 ## Was wird überwacht?
 
 | Shop | Quelle | Wann Mail? |
 |------|--------|------------|
-| **Cardmaniac** | Pre-Order Collection | **Jedes** neue Produkt (+ Priorität im Betreff bei Tech-Sticker/30th) |
-| **Brack** | Pokémon-Sammelkarten (Hersteller „The Pokémon Company“) | Nur wenn Titel **30th / Celebration / 30 Jahre / Tech-Sticker** enthält |
+| **Cardmaniac** | Pre-Order API | **Jedes** neue Produkt |
+| **Brack** | Öffentliche Produkt-Sitemaps | Pokémon-URL enthält **30th / 30-jahre / Tech-Sticker** |
 
 ## Wie funktioniert Brack?
 
-Brack blockiert die normale Suche für Bots. Deshalb lädt der Monitor die Kategorie-Seite mit Pokémon-Filter, liest die Produktliste aus dem HTML und prüft die Titel auf deine Suchbegriffe. Bei einem neuen Treffer kommt eine Mail **mit Direktlink**.
+Die normale Brack-Website blockiert Cloud-Server (Bot-Schutz). Deshalb nutzt der Monitor die **öffentlichen Google-Sitemaps** von Brack, sucht Pokémon-Produkt-Links mit deinen Keywords und schickt bei Neuem eine Mail **mit Direktlink**.
 
-## Secrets (bereits gesetzt)
+Hinweis: Die Sitemap kann gegenüber dem Shop etwas verzögert sein (oft Stunden, selten länger).
 
-- `SMTP_USER` = `mab151204@gmail.com`
-- `SMTP_PASS` = Gmail App-Passwort
+## Secrets
 
-## Manuell testen
-
-Im Repo: **Actions → Cardmaniac + Brack Monitor → Run workflow**
+- `SMTP_USER` / `SMTP_PASS` (Gmail App-Passwort) — bereits gesetzt
