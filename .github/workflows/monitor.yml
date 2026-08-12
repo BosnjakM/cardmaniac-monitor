@@ -2,8 +2,15 @@ name: Stock & Pre-Order Monitor
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    # Backup only — GitHub delays this heavily; real trigger is external cron
+    - cron: "*/5 * * * *"
   workflow_dispatch:
+  repository_dispatch:
+    types: [run-monitor]
+
+concurrency:
+  group: stock-monitor
+  cancel-in-progress: true
 
 permissions:
   contents: write
