@@ -35,10 +35,7 @@ BRACK_URL_KEYWORDS = [
     "30-jahre",
     "30jahre",
     "30-jaehrige",
-    "tech-sticker",
-    "techsticker",
-    "sticker-kollektion",
-    "stickerkollektion",
+    "30-jahrige",
 ]
 
 # Highlight these on Cardmaniac (still notifies on all new products there)
@@ -335,7 +332,7 @@ def check_brack() -> None:
             subject = f"🛒 Brack: {len(new_matches)} neue 30th/Celebration-Treffer"
 
         lines = [
-            "Neue Treffer bei Brack (30th / 30 Jahre / Tech-Sticker):",
+            "Neue Treffer bei Brack (30th / 30 Jahre):",
             "https://www.brack.ch/",
             "",
         ]
