@@ -196,6 +196,8 @@ def _http_get(url: str, headers: dict[str, str], timeout: int = 45) -> str:
         "curl",
         "-sL",
         "--fail",
+        "--http1.1",
+        "-4",
         "--retry",
         "2",
         "--retry-delay",
