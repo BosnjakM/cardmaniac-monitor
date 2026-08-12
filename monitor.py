@@ -202,6 +202,30 @@ def _http_get(url: str, headers: dict[str, str], timeout: int = 45) -> str:
         return resp.read().decode("utf-8", errors="ignore")
 
 
+def _curl_get(url: str, headers: dict[str, str], timeout: int = 90) -> str:
+    """Use curl when sites block Python's TLS fingerprint (common with CDNs)."""
+    import subprocess
+
+    cmd = [
+        "curl",
+        "-sL",
+        "--max-time",
+        str(timeout),
+        "-A",
+        headers.get("User-Agent", UA),
+    ]
+    for key, value in headers.items():
+        if key.lower() == "user-agent":
+            continue
+        cmd.extend(["-H", f"{key}: {value}"])
+    cmd.append(url)
+    result = subprocess.run(cmd, capture_output=True, check=False)
+    if result.returncode != 0:
+        err = result.stderr.decode("utf-8", errors="ignore")[:200]
+        raise RuntimeError(f"curl failed ({result.returncode}): {err}")
+    return result.stdout.decode("utf-8", errors="ignore")
+
+
 def _brack_get(opener: urllib.request.OpenerDirector, url: str, timeout: int = 45) -> str:
     req = urllib.request.Request(
         url,
@@ -219,15 +243,17 @@ def _brack_get(opener: urllib.request.OpenerDirector, url: str, timeout: int = 4
 def fetch_brack_via_jina() -> list[dict]:
     """Fallback: fetch rendered HTML through r.jina.ai (works from cloud IPs)."""
     proxy_url = "https://r.jina.ai/" + BRACK_PAGE
-    html = _http_get(
-        proxy_url,
-        headers={
-            "User-Agent": UA,
-            "Accept": "text/html",
-            "X-Return-Format": "html",
-        },
-        timeout=90,
-    )
+    headers = {
+        "User-Agent": UA,
+        "Accept": "text/html",
+        "X-Return-Format": "html",
+    }
+    # Prefer curl: Jina/Akamai often block Python urllib TLS fingerprint.
+    try:
+        html = _curl_get(proxy_url, headers=headers, timeout=90)
+    except Exception as curl_exc:  # noqa: BLE001
+        print(f"[Brack] curl-Proxy fehlgeschlagen ({curl_exc}), versuche urllib…")
+        html = _http_get(proxy_url, headers=headers, timeout=90)
     products = parse_brack_products(html)
     if not products:
         raise RuntimeError("Jina-Fallback lieferte keine Produkte")
