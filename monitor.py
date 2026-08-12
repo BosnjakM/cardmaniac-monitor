@@ -196,7 +196,13 @@ def _brack_opener() -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
 
 
-def _brack_get(opener: urllib.request.OpenerDirector, url: str) -> str:
+def _http_get(url: str, headers: dict[str, str], timeout: int = 45) -> str:
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", errors="ignore")
+
+
+def _brack_get(opener: urllib.request.OpenerDirector, url: str, timeout: int = 45) -> str:
     req = urllib.request.Request(
         url,
         headers={
@@ -206,23 +212,53 @@ def _brack_get(opener: urllib.request.OpenerDirector, url: str) -> str:
             "Referer": "https://www.brack.ch/",
         },
     )
-    with opener.open(req, timeout=45) as resp:
+    with opener.open(req, timeout=timeout) as resp:
         return resp.read().decode("utf-8", errors="ignore")
 
 
-def fetch_brack_pokemon(retries: int = 3) -> list[dict]:
+def fetch_brack_via_jina() -> list[dict]:
+    """Fallback: fetch rendered HTML through r.jina.ai (works from cloud IPs)."""
+    proxy_url = "https://r.jina.ai/" + BRACK_PAGE
+    html = _http_get(
+        proxy_url,
+        headers={
+            "User-Agent": UA,
+            "Accept": "text/html",
+            "X-Return-Format": "html",
+        },
+        timeout=90,
+    )
+    products = parse_brack_products(html)
+    if not products:
+        raise RuntimeError("Jina-Fallback lieferte keine Produkte")
+    return products
+
+
+def fetch_brack_pokemon(retries: int = 1) -> list[dict]:
     last_err: Exception | None = None
+
+    # 1) Direct fetch (works from home networks; often blocked from cloud)
     for attempt in range(1, retries + 1):
         try:
             opener = _brack_opener()
-            # Warm-up cookies (Akamai)
-            _brack_get(opener, "https://www.brack.ch/")
-            html = _brack_get(opener, BRACK_PAGE)
-            return parse_brack_products(html)
+            _brack_get(opener, "https://www.brack.ch/", timeout=20)
+            html = _brack_get(opener, BRACK_PAGE, timeout=25)
+            products = parse_brack_products(html)
+            if products:
+                return products
+            raise RuntimeError("Seite geladen, aber keine Produkte gefunden")
         except Exception as exc:  # noqa: BLE001 - network/Akamai flakiness
             last_err = exc
-            print(f"[Brack] Versuch {attempt}/{retries} fehlgeschlagen: {exc}")
-            time.sleep(2 * attempt)
+            print(f"[Brack] Direktversuch {attempt}/{retries} fehlgeschlagen: {exc}")
+
+    # 2) Cloud-friendly proxy (needed on GitHub Actions)
+    try:
+        print("[Brack] Nutze Jina-Proxy-Fallback…")
+        return fetch_brack_via_jina()
+    except Exception as exc:  # noqa: BLE001
+        last_err = exc
+        print(f"[Brack] Jina-Fallback fehlgeschlagen: {exc}")
+
     raise RuntimeError(f"Brack konnte nicht geladen werden: {last_err}")
 
 
@@ -341,22 +377,13 @@ def check_brack() -> None:
 
 
 def main() -> None:
-    errors: list[str] = []
-
-    try:
-        check_cardmaniac()
-    except Exception as exc:  # noqa: BLE001
-        errors.append(f"Cardmaniac: {exc}")
-        print(f"[Cardmaniac] FEHLER: {exc}")
+    # Cardmaniac is critical; Brack may flake due to bot protection.
+    check_cardmaniac()
 
     try:
         check_brack()
     except Exception as exc:  # noqa: BLE001
-        errors.append(f"Brack: {exc}")
-        print(f"[Brack] FEHLER: {exc}")
-
-    if errors:
-        raise SystemExit(" / ".join(errors))
+        print(f"[Brack] FEHLER (Cardmaniac läuft trotzdem weiter): {exc}")
 
 
 if __name__ == "__main__":
