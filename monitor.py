@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Monitor Cardmaniac, CardCollectors stock, and Brack."""
+"""Monitor Cardmaniac, CardCollectors, Manor, and Brack."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import ssl
 import subprocess
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.message import EmailMessage
 from pathlib import Path
 
@@ -27,6 +28,18 @@ CARDMANIAC_SEEN = ROOT / "seen.json"
 CARDCOLLECTORS_WATCHLIST = ROOT / "watchlist_cardcollectors.json"
 CARDCOLLECTORS_STOCK = ROOT / "stock_cardcollectors.json"
 CARDCOLLECTORS_API = "https://cardcollectors.ch/wp-json/wc/store/v1/products"
+
+# --- Manor (Pokemon search → notify on 30th / 30 Jahre titles) ---
+MANOR_SEEN = ROOT / "seen_manor.json"
+MANOR_SEARCH = "https://www.manor.ch/de/search"
+MANOR_KEYWORDS = [
+    "30th",
+    "30 jahre",
+    "30-jahre",
+    "30jährigen",
+    "30-jährigen",
+    "30 jaehrige",
+]
 
 # --- Brack (notify only on keyword matches via public sitemaps) ---
 BRACK_SEEN = ROOT / "seen_brack.json"
@@ -285,6 +298,150 @@ def check_cardcollectors() -> None:
     )
 
 
+# ----- Manor -----
+
+
+def _manor_fetch_page(page: int) -> tuple[int, list[dict]]:
+    params = {"query": "Pokemon", "brand": "pokemon", "page": str(page)}
+    url = MANOR_SEARCH + "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": UA,
+            "Accept-Language": "de-CH,de;q=0.9",
+            "Accept": "text/html",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        html = resp.read().decode("utf-8", errors="ignore")
+
+    m = re.search(
+        r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, flags=re.S
+    )
+    if not m:
+        raise RuntimeError(f"Manor __NEXT_DATA__ fehlt (page={page})")
+
+    data = json.loads(m.group(1))
+    page_props = data["props"]["pageProps"]
+    total = int(page_props.get("plpProductNumber") or 0)
+    state = page_props["initialApolloState"]
+
+    items: list[dict] = []
+    for key, val in state.items():
+        if not str(key).startswith("IndexedProduct:") or not isinstance(val, dict):
+            continue
+        title = val.get("name") or ""
+        items.append(
+            {
+                "id": str(val.get("code") or str(key).split("/")[-1]),
+                "title": title,
+                "url": val.get("link")
+                or f"https://www.manor.ch/p/{str(key).split('/')[-1]}",
+                "brand": val.get("brandName") or val.get("brandId") or "",
+                "stock": (val.get("stock") or {}).get("status"),
+            }
+        )
+    return total, items
+
+
+def fetch_manor_keyword_products() -> list[dict]:
+    total, first = _manor_fetch_page(0)
+    page_size = max(len(first), 1)
+    pages = max(1, (total + page_size - 1) // page_size)
+    print(f"[Manor] Pokémon-Suche: {total} Produkte, {pages} Seiten")
+
+    by_id: dict[str, dict] = {p["id"]: p for p in first}
+
+    def load(page: int) -> list[dict]:
+        _, items = _manor_fetch_page(page)
+        return items
+
+    if pages > 1:
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            futs = {pool.submit(load, p): p for p in range(1, pages)}
+            for fut in as_completed(futs):
+                page = futs[fut]
+                try:
+                    for item in fut.result():
+                        by_id[item["id"]] = item
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[Manor] Seite {page} fehlgeschlagen: {exc}")
+
+    matching = [
+        p
+        for p in by_id.values()
+        if matches_keywords(p["title"], MANOR_KEYWORDS)
+    ]
+    return matching
+
+
+def check_manor() -> None:
+    matching = fetch_manor_keyword_products()
+    print(f"[Manor] Keyword-Treffer (30th / 30 Jahre): {len(matching)}")
+    for p in matching:
+        print(f"  · {p['title']} [{p.get('stock')}]")
+
+    raw: dict = {"product_ids": [], "initialized": False}
+    if MANOR_SEEN.exists():
+        raw = json.loads(MANOR_SEEN.read_text(encoding="utf-8"))
+
+    seen = {str(x) for x in raw.get("product_ids", [])}
+    initialized = bool(raw.get("initialized"))
+    match_ids = {p["id"] for p in matching}
+
+    if not initialized:
+        MANOR_SEEN.write_text(
+            json.dumps(
+                {"product_ids": sorted(match_ids), "initialized": True},
+                indent=2,
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        print("[Manor] Erster Lauf: State gespeichert, keine Mail.")
+        return
+
+    new_matches = [p for p in matching if p["id"] not in seen]
+    if new_matches:
+        print("[Manor] NEUE Treffer:")
+        for p in new_matches:
+            print(f"  - {p['title']}")
+
+        if len(new_matches) == 1:
+            subject = f"🏬 Manor: {new_matches[0]['title']}"
+        else:
+            subject = f"🏬 Manor: {len(new_matches)} neue 30th/30-Jahre Treffer"
+
+        lines = [
+            "Neue Pokémon-Treffer bei Manor (Suche: Pokemon, Filter: 30th / 30 Jahre):",
+            "https://www.manor.ch/de/search?query=Pokemon",
+            "",
+        ]
+        for p in new_matches:
+            lines.append(f"- {p['title']}")
+            lines.append(f"  {p['url']}")
+            if p.get("stock"):
+                lines.append(f"  Status: {p['stock']}")
+            lines.append("")
+        send_email(subject, "\n".join(lines))
+    else:
+        print("[Manor] Keine neuen Keyword-Treffer.")
+
+    MANOR_SEEN.write_text(
+        json.dumps(
+            {
+                "product_ids": sorted(seen | match_ids),
+                "initialized": True,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 # ----- Brack -----
 
 
@@ -452,6 +609,11 @@ def main() -> None:
         check_cardcollectors()
     except Exception as exc:  # noqa: BLE001
         print(f"[CardCollectors] FEHLER: {exc}")
+
+    try:
+        check_manor()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[Manor] FEHLER: {exc}")
 
     # Brack is often blocked from GitHub cloud — only run when forced.
     if FORCE_BRACK_SCAN:

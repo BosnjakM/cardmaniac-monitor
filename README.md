@@ -5,9 +5,10 @@ Mail an **mab151204@gmail.com**, läuft auf GitHub Actions (~alle 10 Min).
 | Shop | Was | Status |
 |------|-----|--------|
 | **Cardmaniac** | jedes neue Pre-Order-Produkt | aktiv |
-| **CardCollectors** | Watchlist: Wechsel von „Nicht vorrätig“ → „In den Warenkorb“ | aktiv |
-| **Brack** | 30th / 30 Jahre | oft blockiert von Cloud → besser Google Alert |
+| **CardCollectors** | Watchlist → „In den Warenkorb“ | aktiv |
+| **Manor** | Suche `Pokemon` → Titel mit **30th / 30 Jahre** | aktiv |
+| **Brack** | 30th / 30 Jahre | Cloud oft blockiert → Google Alert |
 
-## CardCollectors Watchlist
+## Manor
 
-Links in `watchlist_cardcollectors.json`. Aktuell die 8× 30th Celebration Produkte.
+Prüft `https://www.manor.ch/de/search?query=Pokemon` (Marke Pokémon) und mailt, sobald ein **neues** Produkt mit 30th / 30 Jahre im Namen auftaucht.
