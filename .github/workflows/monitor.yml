@@ -1,4 +1,4 @@
-name: Cardmaniac Pre-Order Monitor
+name: Cardmaniac + Brack Monitor
 
 on:
   schedule:
@@ -30,13 +30,13 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
         run: python monitor.py
 
-      - name: Commit updated seen.json
+      - name: Commit updated seen files
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add seen.json
+          git add seen.json seen_brack.json
           if git diff --staged --quiet; then
-            echo "Keine Änderung an seen.json"
+            echo "Keine Änderung an seen-Dateien"
           else
             git commit -m "chore: update seen products"
             git push
