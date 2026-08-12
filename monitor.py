@@ -196,6 +196,10 @@ def _http_get(url: str, headers: dict[str, str], timeout: int = 45) -> str:
         "curl",
         "-sL",
         "--fail",
+        "--retry",
+        "2",
+        "--retry-delay",
+        "1",
         "--max-time",
         str(timeout),
         "-A",
@@ -210,10 +214,10 @@ def _http_get(url: str, headers: dict[str, str], timeout: int = 45) -> str:
     if result.returncode == 0 and result.stdout:
         return result.stdout.decode("utf-8", errors="ignore")
 
-    # Fallback to urllib
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read().decode("utf-8", errors="ignore")
+    err = result.stderr.decode("utf-8", errors="ignore")[:160]
+    raise RuntimeError(
+        f"curl failed code={result.returncode} bytes={len(result.stdout)} err={err!r} url={url}"
+    )
 
 
 def _slug_title(url: str) -> str:
@@ -239,42 +243,50 @@ def _url_matches_keywords(url: str) -> bool:
 
 
 def fetch_brack_sitemap_urls() -> list[str]:
-    index_xml = _http_get(
-        BRACK_SITEMAP_INDEX,
-        headers={"User-Agent": UA, "Accept": "application/xml,text/xml,*/*"},
-        timeout=60,
-    )
-    sitemap_urls = [
-        u
-        for u in re.findall(r"<loc>([^<]+)</loc>", index_xml)
-        if "google-product-sitemap-" in u
-    ]
-    if not sitemap_urls:
-        raise RuntimeError("Keine Product-Sitemaps im Index gefunden")
-
-    print(f"[Brack] Lade {len(sitemap_urls)} Product-Sitemaps…")
     headers = {"User-Agent": UA, "Accept": "application/xml,text/xml,*/*"}
+
+    # Prefer index; fall back to known numbered product sitemaps.
+    sitemap_urls: list[str] = []
+    try:
+        index_xml = _http_get(BRACK_SITEMAP_INDEX, headers=headers, timeout=90)
+        sitemap_urls = [
+            u
+            for u in re.findall(r"<loc>([^<]+)</loc>", index_xml)
+            if "google-product-sitemap-" in u
+        ]
+    except Exception as exc:  # noqa: BLE001
+        print(f"[Brack] Sitemap-Index fehlgeschlagen ({exc}), nutze Nummerierung 1–40")
+
+    if not sitemap_urls:
+        sitemap_urls = [
+            f"https://www.brack.ch/exports/google/brack.ch/de/google-product-sitemap-{i}.xml"
+            for i in range(1, 41)
+        ]
+
+    print(f"[Brack] Lade bis zu {len(sitemap_urls)} Product-Sitemaps…")
     urls: list[str] = []
 
     def load_one(sm_url: str) -> list[str]:
-        xml = _http_get(sm_url, headers=headers, timeout=45)
+        xml = _http_get(sm_url, headers=headers, timeout=90)
         return re.findall(r"<loc>([^<]+)</loc>", xml)
 
     ok = 0
-    with ThreadPoolExecutor(max_workers=6) as pool:
+    with ThreadPoolExecutor(max_workers=4) as pool:
         futures = {pool.submit(load_one, u): u for u in sitemap_urls}
         for fut in as_completed(futures):
             sm_url = futures[fut]
             try:
                 found = fut.result()
-                urls.extend(found)
-                ok += 1
+                if found:
+                    urls.extend(found)
+                    ok += 1
             except Exception as exc:  # noqa: BLE001
-                print(f"[Brack] Sitemap übersprungen ({sm_url}): {exc}")
+                # Missing numbers (e.g. 32–40) are expected when falling back.
+                print(f"[Brack] Sitemap übersprungen: {exc}")
 
     if ok == 0:
         raise RuntimeError("Keine Product-Sitemap konnte geladen werden")
-    print(f"[Brack] {ok}/{len(sitemap_urls)} Sitemaps geladen, {len(urls)} URLs")
+    print(f"[Brack] {ok} Sitemaps geladen, {len(urls)} URLs")
     return urls
 
 
