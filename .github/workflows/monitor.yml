@@ -12,6 +12,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -28,16 +29,18 @@ jobs:
           SMTP_PORT: "587"
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          # Full Brack scan only when sitemap changed (or set to 1 to force)
+          FORCE_BRACK_SCAN: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
         run: python monitor.py
 
-      - name: Commit updated seen files
+      - name: Commit updated state files
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add seen.json seen_brack.json
+          git add seen.json seen_brack.json brack_sitemap_state.json
           if git diff --staged --quiet; then
-            echo "Keine Änderung an seen-Dateien"
+            echo "Keine Änderung an State-Dateien"
           else
-            git commit -m "chore: update seen products"
+            git commit -m "chore: update monitor state"
             git push
           fi

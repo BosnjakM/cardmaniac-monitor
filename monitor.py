@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import smtplib
 import ssl
+import subprocess
 import urllib.parse
 import urllib.request
 from email.message import EmailMessage
@@ -22,6 +24,22 @@ CARDMANIAC_SEEN = ROOT / "seen.json"
 
 # --- Brack (notify only on keyword matches via public sitemaps) ---
 BRACK_SEEN = ROOT / "seen_brack.json"
+BRACK_STATE = ROOT / "brack_sitemap_state.json"
+BRACK_SITEMAP_INDEX = (
+    "https://www.brack.ch/exports/google/brack.ch/de/sitemap-index.xml"
+)
+
+# Match against URL slug (lowercase). Keep specific to avoid false positives.
+BRACK_URL_KEYWORDS = [
+    "30th",
+    "30-jahre",
+    "30jahre",
+    "30-jaehrige",
+    "tech-sticker",
+    "techsticker",
+    "sticker-kollektion",
+    "stickerkollektion",
+]
 
 # Highlight these on Cardmaniac (still notifies on all new products there)
 CARDMANIAC_PRIORITY_KEYWORDS = [
@@ -37,6 +55,11 @@ SMTP_HOST = os.environ.get("SMTP_HOST") or "smtp.gmail.com"
 SMTP_PORT = int(os.environ.get("SMTP_PORT") or "587")
 SMTP_USER = os.environ.get("SMTP_USER") or ""
 SMTP_PASS = os.environ.get("SMTP_PASS") or ""
+FORCE_BRACK_SCAN = (os.environ.get("FORCE_BRACK_SCAN") or "").strip() in {
+    "1",
+    "true",
+    "yes",
+}
 
 UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -168,29 +191,10 @@ def check_cardmaniac() -> None:
     save_seen(CARDMANIAC_SEEN, current_ids)
 
 
-# ----- Brack (via public Google product sitemaps — works on GitHub Actions) -----
-
-BRACK_SITEMAP_INDEX = (
-    "https://www.brack.ch/exports/google/brack.ch/de/sitemap-index.xml"
-)
-
-# Match against URL slug (lowercase). Keep specific to avoid false positives.
-BRACK_URL_KEYWORDS = [
-    "30th",
-    "30-jahre",
-    "30jahre",
-    "30-jaehrige",
-    "tech-sticker",
-    "techsticker",
-    "sticker-kollektion",
-    "stickerkollektion",
-]
+# ----- Brack -----
 
 
-def _http_get(url: str, headers: dict[str, str], timeout: int = 45) -> str:
-    """Fetch URL; prefer curl (more reliable from GitHub Actions vs some CDNs)."""
-    import subprocess
-
+def _curl_get(url: str, timeout: int = 45) -> bytes:
     cmd = [
         "curl",
         "-sL",
@@ -204,26 +208,19 @@ def _http_get(url: str, headers: dict[str, str], timeout: int = 45) -> str:
         "--max-time",
         str(timeout),
         "-A",
-        headers.get("User-Agent", UA),
+        UA,
+        "-H",
+        "Accept: application/xml,text/xml,*/*",
+        url,
     ]
-    for key, value in headers.items():
-        if key.lower() == "user-agent":
-            continue
-        cmd.extend(["-H", f"{key}: {value}"])
-    cmd.append(url)
     result = subprocess.run(cmd, capture_output=True, check=False)
-    if result.returncode == 0 and result.stdout:
-        return result.stdout.decode("utf-8", errors="ignore")
-
-    err = result.stderr.decode("utf-8", errors="ignore")[:160]
-    raise RuntimeError(
-        f"curl failed code={result.returncode} bytes={len(result.stdout)} err={err!r} url={url}"
-    )
+    if result.returncode != 0 or not result.stdout:
+        raise RuntimeError(f"curl {result.returncode} for {url}")
+    return result.stdout
 
 
 def _slug_title(url: str) -> str:
     path = urllib.parse.urlparse(url).path.strip("/")
-    # e.g. the-pokemon-company-pokemon-lumiose-city-mini-tin-en-2111867
     parts = path.split("-")
     if parts and parts[-1].isdigit():
         parts = parts[:-1]
@@ -233,34 +230,34 @@ def _slug_title(url: str) -> str:
     return title[:1].upper() + title[1:] if title else path
 
 
-def fetch_brack_keyword_products() -> list[dict]:
-    """Scan Brack product sitemaps for Pokémon URLs matching keywords."""
-    import subprocess
+def _index_fingerprint(index_xml: str) -> str:
+    """Hash of product-sitemap loc+lastmod pairs — changes when catalog export updates."""
+    blocks = re.findall(
+        r"<sitemap>\s*<loc>([^<]*google-product-sitemap-[^<]*)</loc>\s*"
+        r"(?:<lastmod>([^<]*)</lastmod>)?",
+        index_xml,
+        flags=re.I | re.S,
+    )
+    if not blocks:
+        # Fallback: hash whole index
+        return hashlib.sha256(index_xml.encode("utf-8")).hexdigest()
+    material = "\n".join(f"{loc}|{lastmod}" for loc, lastmod in sorted(blocks))
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
-    headers_accept = "application/xml,text/xml,*/*"
-    sitemap_urls = [
-        f"https://www.brack.ch/exports/google/brack.ch/de/google-product-sitemap-{i}.xml"
-        for i in range(1, 32)
-    ]
 
-    # Try to refine list from index (optional).
-    try:
-        idx = _http_get(
-            BRACK_SITEMAP_INDEX,
-            headers={"User-Agent": UA, "Accept": headers_accept},
-            timeout=30,
-        )
-        found = [
-            u
-            for u in re.findall(r"<loc>([^<]+)</loc>", idx)
-            if "google-product-sitemap-" in u
-        ]
-        if found:
-            sitemap_urls = found
-    except Exception as exc:  # noqa: BLE001
-        print(f"[Brack] Index optional fehlgeschlagen ({exc}), nutze 1–31")
+def _load_brack_state() -> dict:
+    if not BRACK_STATE.exists():
+        return {}
+    return json.loads(BRACK_STATE.read_text(encoding="utf-8"))
 
-    print(f"[Brack] Scanne {len(sitemap_urls)} Product-Sitemaps…")
+
+def _save_brack_state(state: dict) -> None:
+    BRACK_STATE.write_text(
+        json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+
+
+def scan_brack_sitemaps(sitemap_urls: list[str]) -> list[dict]:
     pattern = re.compile(
         r"https://www\.brack\.ch/[^<\s\"]*(?:the-pokemon-company|pokemon)[^<\s\"]*",
         re.I,
@@ -270,57 +267,63 @@ def fetch_brack_keyword_products() -> list[dict]:
     products: dict[str, dict] = {}
     ok = 0
     for sm_url in sitemap_urls:
-        cmd = [
-            "curl",
-            "-sL",
-            "--fail",
-            "--http1.1",
-            "-4",
-            "--max-time",
-            "60",
-            "-A",
-            UA,
-            "-H",
-            f"Accept: {headers_accept}",
-            sm_url,
-        ]
         try:
-            result = subprocess.run(cmd, capture_output=True, check=False)
-            if result.returncode != 0 or not result.stdout:
-                print(f"[Brack] Skip {sm_url.split('/')[-1]} (curl {result.returncode})")
-                continue
-            text = result.stdout.decode("utf-8", errors="ignore")
-            ok += 1
-            for url in pattern.findall(text):
-                if not kw_re.search(url):
-                    continue
-                sku = url.rstrip("/").rsplit("-", 1)[-1]
-                pid = sku if sku.isdigit() else url
-                products[pid] = {
-                    "id": pid,
-                    "title": _slug_title(url),
-                    "url": url,
-                    "shop": "Brack",
-                }
+            raw = _curl_get(sm_url, timeout=45)
         except Exception as exc:  # noqa: BLE001
-            print(f"[Brack] Skip {sm_url}: {exc}")
+            print(f"[Brack] Skip {sm_url.split('/')[-1]}: {exc}")
+            continue
+        ok += 1
+        text = raw.decode("utf-8", errors="ignore")
+        for url in pattern.findall(text):
+            if not kw_re.search(url):
+                continue
+            sku = url.rstrip("/").rsplit("-", 1)[-1]
+            pid = sku if sku.isdigit() else url
+            products[pid] = {
+                "id": pid,
+                "title": _slug_title(url),
+                "url": url,
+                "shop": "Brack",
+            }
 
     if ok == 0:
         raise RuntimeError("Keine Product-Sitemap konnte geladen werden")
-    print(f"[Brack] {ok}/{len(sitemap_urls)} Sitemaps OK, Treffer: {len(products)}")
+    print(f"[Brack] {ok}/{len(sitemap_urls)} Sitemaps gescannt, Treffer: {len(products)}")
     return list(products.values())
 
 
 def check_brack() -> None:
-    matching = fetch_brack_keyword_products()
-    print(f"[Brack] Keyword-Treffer in Sitemap: {len(matching)}")
+    # 1) Tiny index fetch — decide whether a full scan is needed
+    index_xml = _curl_get(BRACK_SITEMAP_INDEX, timeout=30).decode("utf-8", errors="ignore")
+    fingerprint = _index_fingerprint(index_xml)
+    sitemap_urls = [
+        u
+        for u in re.findall(r"<loc>([^<]+)</loc>", index_xml)
+        if "google-product-sitemap-" in u
+    ]
+    if not sitemap_urls:
+        sitemap_urls = [
+            f"https://www.brack.ch/exports/google/brack.ch/de/google-product-sitemap-{i}.xml"
+            for i in range(1, 32)
+        ]
+
+    state = _load_brack_state()
+    prev = state.get("fingerprint")
+    if prev == fingerprint and not FORCE_BRACK_SCAN:
+        print("[Brack] Sitemap unverändert — kein Full-Scan nötig.")
+        return
+
+    reason = "erzwungen" if FORCE_BRACK_SCAN else "Sitemap-Index geändert"
+    print(f"[Brack] Full-Scan ({reason})…")
+    matching = scan_brack_sitemaps(sitemap_urls)
+    print(f"[Brack] Keyword-Treffer: {len(matching)}")
     for p in matching:
         print(f"  · {p['title']}")
 
     seen = load_seen(BRACK_SEEN)
     match_ids = {p["id"] for p in matching}
-
     new_matches = [p for p in matching if p["id"] not in seen]
+
     if new_matches:
         print("[Brack] NEUE Keyword-Treffer:")
         for p in new_matches:
@@ -345,12 +348,11 @@ def check_brack() -> None:
         print("[Brack] Keine neuen Keyword-Treffer.")
 
     save_seen(BRACK_SEEN, seen | match_ids)
+    _save_brack_state({"fingerprint": fingerprint})
 
 
 def main() -> None:
-    # Cardmaniac is critical; Brack may flake due to bot protection.
     check_cardmaniac()
-
     try:
         check_brack()
     except Exception as exc:  # noqa: BLE001
