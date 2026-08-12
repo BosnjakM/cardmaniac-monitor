@@ -1,22 +1,16 @@
 # Stock & Pre-Order Monitor
 
-Mail an **mab151204@gmail.com**, läuft auf GitHub Actions (~alle 10 Min).
+Mail an **mab151204@gmail.com**.
 
 | Shop | Was | Status |
 |------|-----|--------|
 | **Cardmaniac** | jedes neue Pre-Order-Produkt | aktiv |
 | **CardCollectors** | Watchlist → „In den Warenkorb“ | aktiv |
 | **Manor** | Suche Pokemon → 30th / 30 Jahre | aktiv |
-| **Ryu.land** | Collection `30th-30th-celebration` + neue 30th/Pre-Order-Collections | aktiv |
-| **Brack** | 30th / 30 Jahre | Cloud oft blockiert → Google Alert |
+| **Ryu.land** | 30th Celebration Collection / Pre-Orders | aktiv |
+| **Brack** | oft blockiert → Google Alert | teils |
 
-## Ryu.land – Strategie (ohne Link raten)
+## Wichtig: zuverlässiger Timer
 
-Die Collection existiert bereits:  
-https://ryu.land/collections/30th-30th-celebration
-
-Der Monitor prüft:
-1. **Neue Produkte** in dieser Collection  
-2. **Neue Collections** mit 30th/Celebration oder Pokémon-Pre-Order im Namen  
-3. **Search** nach „30th“ + Pokémon (falls Produkte anders einsortiert werden)  
-4. **Varianten** in der 30th-Collection, die von nicht verfügbar → verfügbar wechseln (z. B. DE)
+GitHub-Cron allein verzögert oft stark (bis 1h+).  
+Für echte ~5-Minuten-Checks folge **`CRON_SETUP.md`** (cron-job.org).
