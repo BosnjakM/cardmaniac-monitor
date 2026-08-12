@@ -10,7 +10,6 @@ import smtplib
 import ssl
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.message import EmailMessage
 from pathlib import Path
 
@@ -234,84 +233,82 @@ def _slug_title(url: str) -> str:
     return title[:1].upper() + title[1:] if title else path
 
 
-def _is_pokemon_url(url: str) -> bool:
-    low = url.casefold()
-    return "the-pokemon-company" in low or "pokemon" in low or "pokémon" in low
+def fetch_brack_keyword_products() -> list[dict]:
+    """Scan Brack product sitemaps for Pokémon URLs matching keywords."""
+    import subprocess
 
+    headers_accept = "application/xml,text/xml,*/*"
+    sitemap_urls = [
+        f"https://www.brack.ch/exports/google/brack.ch/de/google-product-sitemap-{i}.xml"
+        for i in range(1, 32)
+    ]
 
-def _url_matches_keywords(url: str) -> bool:
-    low = url.casefold()
-    return any(k in low for k in BRACK_URL_KEYWORDS)
-
-
-def fetch_brack_sitemap_urls() -> list[str]:
-    headers = {"User-Agent": UA, "Accept": "application/xml,text/xml,*/*"}
-
-    # Prefer index; fall back to known numbered product sitemaps.
-    sitemap_urls: list[str] = []
+    # Try to refine list from index (optional).
     try:
-        index_xml = _http_get(BRACK_SITEMAP_INDEX, headers=headers, timeout=90)
-        sitemap_urls = [
+        idx = _http_get(
+            BRACK_SITEMAP_INDEX,
+            headers={"User-Agent": UA, "Accept": headers_accept},
+            timeout=30,
+        )
+        found = [
             u
-            for u in re.findall(r"<loc>([^<]+)</loc>", index_xml)
+            for u in re.findall(r"<loc>([^<]+)</loc>", idx)
             if "google-product-sitemap-" in u
         ]
+        if found:
+            sitemap_urls = found
     except Exception as exc:  # noqa: BLE001
-        print(f"[Brack] Sitemap-Index fehlgeschlagen ({exc}), nutze Nummerierung 1–40")
+        print(f"[Brack] Index optional fehlgeschlagen ({exc}), nutze 1–31")
 
-    if not sitemap_urls:
-        sitemap_urls = [
-            f"https://www.brack.ch/exports/google/brack.ch/de/google-product-sitemap-{i}.xml"
-            for i in range(1, 41)
-        ]
+    print(f"[Brack] Scanne {len(sitemap_urls)} Product-Sitemaps…")
+    pattern = re.compile(
+        r"https://www\.brack\.ch/[^<\s\"]*(?:the-pokemon-company|pokemon)[^<\s\"]*",
+        re.I,
+    )
+    kw_re = re.compile("|".join(re.escape(k) for k in BRACK_URL_KEYWORDS), re.I)
 
-    print(f"[Brack] Lade bis zu {len(sitemap_urls)} Product-Sitemaps…")
-    urls: list[str] = []
-
-    def load_one(sm_url: str) -> list[str]:
-        xml = _http_get(sm_url, headers=headers, timeout=90)
-        return re.findall(r"<loc>([^<]+)</loc>", xml)
-
+    products: dict[str, dict] = {}
     ok = 0
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {pool.submit(load_one, u): u for u in sitemap_urls}
-        for fut in as_completed(futures):
-            sm_url = futures[fut]
-            try:
-                found = fut.result()
-                if found:
-                    urls.extend(found)
-                    ok += 1
-            except Exception as exc:  # noqa: BLE001
-                # Missing numbers (e.g. 32–40) are expected when falling back.
-                print(f"[Brack] Sitemap übersprungen: {exc}")
+    for sm_url in sitemap_urls:
+        cmd = [
+            "curl",
+            "-sL",
+            "--fail",
+            "--http1.1",
+            "-4",
+            "--max-time",
+            "60",
+            "-A",
+            UA,
+            "-H",
+            f"Accept: {headers_accept}",
+            sm_url,
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, check=False)
+            if result.returncode != 0 or not result.stdout:
+                print(f"[Brack] Skip {sm_url.split('/')[-1]} (curl {result.returncode})")
+                continue
+            text = result.stdout.decode("utf-8", errors="ignore")
+            ok += 1
+            for url in pattern.findall(text):
+                if not kw_re.search(url):
+                    continue
+                sku = url.rstrip("/").rsplit("-", 1)[-1]
+                pid = sku if sku.isdigit() else url
+                products[pid] = {
+                    "id": pid,
+                    "title": _slug_title(url),
+                    "url": url,
+                    "shop": "Brack",
+                }
+        except Exception as exc:  # noqa: BLE001
+            print(f"[Brack] Skip {sm_url}: {exc}")
 
     if ok == 0:
         raise RuntimeError("Keine Product-Sitemap konnte geladen werden")
-    print(f"[Brack] {ok} Sitemaps geladen, {len(urls)} URLs")
-    return urls
-
-
-def fetch_brack_keyword_products() -> list[dict]:
-    all_urls = fetch_brack_sitemap_urls()
-    products: list[dict] = []
-    for url in all_urls:
-        if not _is_pokemon_url(url):
-            continue
-        if not _url_matches_keywords(url):
-            continue
-        sku = url.rstrip("/").rsplit("-", 1)[-1]
-        products.append(
-            {
-                "id": sku if sku.isdigit() else url,
-                "title": _slug_title(url),
-                "url": url,
-                "shop": "Brack",
-            }
-        )
-    # de-dupe by id
-    by_id = {p["id"]: p for p in products}
-    return list(by_id.values())
+    print(f"[Brack] {ok}/{len(sitemap_urls)} Sitemaps OK, Treffer: {len(products)}")
+    return list(products.values())
 
 
 def check_brack() -> None:
