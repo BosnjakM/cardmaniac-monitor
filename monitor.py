@@ -74,7 +74,7 @@ CARDMANIAC_PRIORITY_KEYWORDS = [
     "sticker kollektion",
 ]
 
-MAIL_TO = os.environ.get("MAIL_TO") or "mab151204@gmail.com"
+MAIL_TO = (os.environ.get("MAIL_TO") or "").strip()
 SMTP_HOST = os.environ.get("SMTP_HOST") or "smtp.gmail.com"
 SMTP_PORT = int(os.environ.get("SMTP_PORT") or "587")
 SMTP_USER = os.environ.get("SMTP_USER") or ""
@@ -113,9 +113,9 @@ def save_seen(path: Path, product_ids: set[str] | list) -> None:
 
 
 def send_email(subject: str, body: str) -> None:
-    if not SMTP_USER or not SMTP_PASS:
+    if not MAIL_TO or not SMTP_USER or not SMTP_PASS:
         raise SystemExit(
-            "SMTP_USER / SMTP_PASS fehlen. Bitte GitHub Secrets setzen (siehe README)."
+            "MAIL_TO / SMTP_USER / SMTP_PASS fehlen. Bitte GitHub Secrets setzen."
         )
 
     msg = EmailMessage()
@@ -130,7 +130,8 @@ def send_email(subject: str, body: str) -> None:
         server.login(SMTP_USER, SMTP_PASS)
         server.send_message(msg)
 
-    print(f"Email gesendet an {MAIL_TO}: {subject}")
+    # Don't print the address — Actions logs are public on public repos.
+    print(f"Email gesendet: {subject}")
 
 
 # ----- Cardmaniac -----

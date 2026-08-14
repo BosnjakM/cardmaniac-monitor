@@ -1,6 +1,6 @@
 # Stock & Pre-Order Monitor
 
-Mail an **mab151204@gmail.com**.
+Alerts gehen an die Adresse in GitHub Secret `MAIL_TO` (nicht öffentlich).
 
 | Shop | Was | Status |
 |------|-----|--------|
