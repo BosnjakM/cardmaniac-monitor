@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Monitor Cardmaniac, CardCollectors, Manor, and Brack."""
+"""Monitor Cardmaniac, CardCollectors, Manor, Ryu, Pokecard, and Brack."""
 
 from __future__ import annotations
 
@@ -48,6 +48,20 @@ RYU_COLLECTION_URL = (
     f"https://ryu.land/collections/{RYU_COLLECTION}/products.json"
 )
 RYU_COLLECTIONS_JSON = "https://ryu.land/collections.json"
+
+# --- Pokecard.store (Vorbestellungen: neue Produkte + wieder verfügbar) ---
+POKECARD_SEEN = ROOT / "seen_pokecard.json"
+POKECARD_PAGE = "https://pokecard.store/collections/vorbestellung"
+POKECARD_URL = f"{POKECARD_PAGE}/products.json?limit=250"
+POKECARD_PRIORITY_KEYWORDS = [
+    "30th",
+    "30 jahre",
+    "30-jahre",
+    "30th celebration",
+    "30th anniversary",
+    "30ᵉ",
+    "anniversaire",
+]
 
 # --- Brack (notify only on keyword matches via public sitemaps) ---
 BRACK_SEEN = ROOT / "seen_brack.json"
@@ -449,6 +463,137 @@ def check_manor() -> None:
         + "\n",
         encoding="utf-8",
     )
+
+
+# ----- Pokecard.store -----
+
+
+def _pokecard_load_state() -> dict:
+    if not POKECARD_SEEN.exists():
+        return {"product_ids": [], "availability": {}}
+    raw = json.loads(POKECARD_SEEN.read_text(encoding="utf-8"))
+    return {
+        "product_ids": [str(x) for x in raw.get("product_ids", [])],
+        "availability": {
+            str(k): bool(v) for k, v in (raw.get("availability") or {}).items()
+        },
+    }
+
+
+def _pokecard_save_state(product_ids: set[str], availability: dict[str, bool]) -> None:
+    POKECARD_SEEN.write_text(
+        json.dumps(
+            {
+                "product_ids": sorted(product_ids),
+                "availability": {
+                    k: availability[k] for k in sorted(availability)
+                },
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def fetch_pokecard() -> list[dict]:
+    req = urllib.request.Request(POKECARD_URL, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.load(resp)
+
+    products = []
+    for p in data.get("products", []):
+        handle = p.get("handle", "")
+        available = any(bool(v.get("available")) for v in p.get("variants", []))
+        products.append(
+            {
+                "id": str(p["id"]),
+                "title": p.get("title", "(ohne Titel)"),
+                "url": (
+                    f"https://pokecard.store/products/{handle}"
+                    if handle
+                    else POKECARD_PAGE
+                ),
+                "available": available,
+            }
+        )
+    return products
+
+
+def check_pokecard() -> None:
+    products = fetch_pokecard()
+    print(f"[Pokecard] Gefunden: {len(products)} Vorbestellungen")
+
+    state = _pokecard_load_state()
+    seen = set(state["product_ids"])
+    prev_avail = state["availability"]
+    current_ids = {p["id"] for p in products}
+    current_avail = {p["id"]: p["available"] for p in products}
+
+    if not seen:
+        _pokecard_save_state(current_ids, current_avail)
+        print("[Pokecard] Erster Lauf: seen_pokecard.json initialisiert, keine Mail.")
+        return
+
+    new_products = [p for p in products if p["id"] not in seen]
+    restocked = [
+        p
+        for p in products
+        if p["id"] in prev_avail
+        and prev_avail.get(p["id"]) is False
+        and p["available"]
+    ]
+
+    alerts: list[tuple[str, dict]] = []
+    for p in new_products:
+        alerts.append(("NEU", p))
+    for p in restocked:
+        alerts.append(("WIEDER VERFÜGBAR", p))
+
+    if alerts:
+        print("[Pokecard] Alert:")
+        for kind, p in alerts:
+            print(f"  - [{kind}] {p['title']} (available={p['available']})")
+
+        priority = [
+            p
+            for _, p in alerts
+            if matches_keywords(p["title"], POKECARD_PRIORITY_KEYWORDS)
+        ]
+        if priority:
+            subject = f"🎯 Pokecard PRIORITÄT: {priority[0]['title']}"
+            if len(alerts) > 1:
+                subject += f" (+{len(alerts) - 1} weitere)"
+        elif len(alerts) == 1:
+            kind, p = alerts[0]
+            subject = f"🆕 Pokecard [{kind}]: {p['title']}"
+        else:
+            subject = f"🆕 Pokecard: {len(alerts)} Vorbestellungs-Updates"
+
+        lines = [
+            "Updates bei Pokecard Vorbestellungen:",
+            POKECARD_PAGE,
+            "",
+        ]
+        for kind, p in alerts:
+            mark = (
+                " [30th]"
+                if matches_keywords(p["title"], POKECARD_PRIORITY_KEYWORDS)
+                else ""
+            )
+            stock = "verfügbar" if p["available"] else "ausverkauft"
+            lines.append(f"- [{kind}] {p['title']}{mark} ({stock})")
+            lines.append(f"  {p['url']}")
+            lines.append("")
+        send_email(subject, "\n".join(lines))
+    else:
+        print("[Pokecard] Keine neuen / wieder verfügbaren Produkte.")
+
+    # Keep availability for products that left the collection too (until overwritten).
+    merged_avail = dict(prev_avail)
+    merged_avail.update(current_avail)
+    _pokecard_save_state(seen | current_ids, merged_avail)
 
 
 # ----- Ryu.land -----
@@ -884,6 +1029,11 @@ def main() -> None:
         check_ryu()
     except Exception as exc:  # noqa: BLE001
         print(f"[Ryu] FEHLER: {exc}")
+
+    try:
+        check_pokecard()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[Pokecard] FEHLER: {exc}")
 
     # Brack is often blocked from GitHub cloud — only run when forced.
     if FORCE_BRACK_SCAN:

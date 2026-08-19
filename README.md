@@ -8,6 +8,7 @@ Alerts gehen an die Adresse in GitHub Secret `MAIL_TO` (nicht öffentlich).
 | **CardCollectors** | Watchlist → „In den Warenkorb“ | aktiv |
 | **Manor** | Suche Pokemon → 30th / 30 Jahre | aktiv |
 | **Ryu.land** | 30th Celebration Collection / Pre-Orders | aktiv |
+| **Pokecard** | [Vorbestellungen](https://pokecard.store/collections/vorbestellung) neu + Restock | aktiv |
 | **Brack** | oft blockiert → Google Alert | teils |
 
 ## Wichtig: zuverlässiger Timer
