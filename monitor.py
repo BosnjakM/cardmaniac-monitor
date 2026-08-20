@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Monitor Cardmaniac, CardCollectors, Manor, Ryu, Pokecard, and Brack."""
+"""Monitor Cardmaniac, CardCollectors, Manor, Ryu, Pokecard, ManaShop, SparkLeaf, and Brack."""
 
 from __future__ import annotations
 
@@ -27,9 +27,20 @@ CARDMANIAC_SEEN = ROOT / "seen.json"
 # --- CardCollectors (notify when watched products become in stock) ---
 CARDCOLLECTORS_WATCHLIST = ROOT / "watchlist_cardcollectors.json"
 CARDCOLLECTORS_STOCK = ROOT / "stock_cardcollectors.json"
+CARDCOLLECTORS_SEARCH_SEEN = ROOT / "seen_cardcollectors_search.json"
 CARDCOLLECTORS_API = "https://cardcollectors.ch/wp-json/wc/store/v1/products"
+CARDCOLLECTORS_SEARCH_QUERIES = ["Delta Reign", "Delta Herrschaft"]
 
-# --- Manor (Pokemon search → notify on 30th / 30 Jahre titles) ---
+DELTA_KEYWORDS = [
+    "delta reign",
+    "delta-reign",
+    "deltareign",
+    "delta herrschaft",
+    "delta-herrschaft",
+    "deltaherrschaft",
+]
+
+# --- Manor (Pokemon search → 30th / 30 Jahre / Delta Reign) ---
 MANOR_SEEN = ROOT / "seen_manor.json"
 MANOR_SEARCH = "https://www.manor.ch/de/search"
 MANOR_KEYWORDS = [
@@ -39,15 +50,17 @@ MANOR_KEYWORDS = [
     "30jährigen",
     "30-jährigen",
     "30 jaehrige",
+    *DELTA_KEYWORDS,
 ]
 
-# --- Ryu.land (30th Celebration collection + new related collections/products) ---
+# --- Ryu.land (30th Celebration + Delta Reign / Pre-Orders) ---
 RYU_SEEN = ROOT / "seen_ryu.json"
 RYU_COLLECTION = "30th-30th-celebration"
 RYU_COLLECTION_URL = (
     f"https://ryu.land/collections/{RYU_COLLECTION}/products.json"
 )
 RYU_COLLECTIONS_JSON = "https://ryu.land/collections.json"
+RYU_SEARCH_QUERIES = ["30th", "Delta Reign", "Delta Herrschaft"]
 
 # --- Pokecard.store (Vorbestellungen: neue Produkte + wieder verfügbar) ---
 POKECARD_SEEN = ROOT / "seen_pokecard.json"
@@ -61,6 +74,7 @@ POKECARD_PRIORITY_KEYWORDS = [
     "30th anniversary",
     "30ᵉ",
     "anniversaire",
+    *DELTA_KEYWORDS,
 ]
 
 # --- The Mana Shop (Vorverkauf category: neu + wieder verfügbar) ---
@@ -73,9 +87,10 @@ MANASHOP_PRIORITY_KEYWORDS = [
     "celebration",
     "pokemon",
     "pokémon",
+    *DELTA_KEYWORDS,
 ]
 
-# --- SparkLeaf (Pre-Order / Deals, nur 30th) ---
+# --- SparkLeaf (Pre-Order / Deals: 30th + Delta Reign) ---
 SPARKLEAF_SEEN = ROOT / "seen_sparkleaf.json"
 SPARKLEAF_DEALS_PAGE = (
     "https://sparkleaf.ch/pages/pokemon-one-piece-tcg-pre-order-deals"
@@ -91,6 +106,12 @@ SPARKLEAF_KEYWORDS = [
     "30th celebration",
     "30th anniversary",
     "celebration",
+    *DELTA_KEYWORDS,
+]
+SPARKLEAF_SEARCH_QUERIES = [
+    "30th celebration",
+    "Delta Reign",
+    "Delta Herrschaft",
 ]
 
 # --- Brack (notify only on keyword matches via public sitemaps) ---
@@ -107,6 +128,10 @@ BRACK_URL_KEYWORDS = [
     "30jahre",
     "30-jaehrige",
     "30-jahrige",
+    "delta-reign",
+    "deltareign",
+    "delta-herrschaft",
+    "deltaherrschaft",
 ]
 
 # Highlight these on Cardmaniac (still notifies on all new products there)
@@ -116,6 +141,7 @@ CARDMANIAC_PRIORITY_KEYWORDS = [
     "tech sticker",
     "sticker-kollektion",
     "sticker kollektion",
+    *DELTA_KEYWORDS,
 ]
 
 MAIL_TO = (os.environ.get("MAIL_TO") or "").strip()
@@ -351,6 +377,72 @@ def check_cardcollectors() -> None:
     )
 
 
+def fetch_cardcollectors_search(query: str) -> list[dict]:
+    params = urllib.parse.urlencode({"search": query, "per_page": "50"})
+    api = f"{CARDCOLLECTORS_API}?{params}"
+    req = urllib.request.Request(api, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        data = json.load(resp)
+    out: list[dict] = []
+    for p in data or []:
+        title = html_lib.unescape(p.get("name") or "")
+        if not matches_keywords(title, DELTA_KEYWORDS):
+            continue
+        slug = _slug_from_url(p.get("permalink") or "")
+        out.append(
+            {
+                "id": str(p["id"]),
+                "slug": slug,
+                "title": title or slug,
+                "url": p.get("permalink")
+                or f"https://cardcollectors.ch/produkt/{slug}/",
+                "in_stock": bool(p.get("is_in_stock")),
+            }
+        )
+    return out
+
+
+def check_cardcollectors_delta() -> None:
+    """Notify when Delta Reign / Delta Herrschaft products first appear."""
+    by_id: dict[str, dict] = {}
+    for query in CARDCOLLECTORS_SEARCH_QUERIES:
+        try:
+            for p in fetch_cardcollectors_search(query):
+                by_id[p["id"]] = p
+        except Exception as exc:  # noqa: BLE001
+            print(f"[CardCollectors] Delta-Suche '{query}' FEHLER: {exc}")
+
+    print(f"[CardCollectors] Delta-Treffer: {len(by_id)}")
+    for p in by_id.values():
+        print(f"  · {p['title']}")
+
+    seen = load_seen(CARDCOLLECTORS_SEARCH_SEEN)
+    current_ids = set(by_id)
+    new_products = [by_id[i] for i in current_ids if i not in seen]
+
+    if new_products:
+        if len(new_products) == 1:
+            subject = f"🛒 CardCollectors DELTA: {new_products[0]['title']}"
+        else:
+            subject = (
+                f"🛒 CardCollectors: {len(new_products)} neue Delta-Reign-Produkte"
+            )
+        lines = [
+            "Neue Delta Reign / Delta Herrschaft Produkte bei CardCollectors:",
+            "",
+        ]
+        for p in new_products:
+            stock = "In den Warenkorb" if p.get("in_stock") else "Nicht vorrätig"
+            lines.append(f"- {p['title']} ({stock})")
+            lines.append(f"  {p['url']}")
+            lines.append("")
+        send_email(subject, "\n".join(lines))
+    else:
+        print("[CardCollectors] Keine neuen Delta-Produkte.")
+
+    save_seen(CARDCOLLECTORS_SEARCH_SEEN, seen | current_ids)
+
+
 # ----- Manor -----
 
 
@@ -430,7 +522,7 @@ def fetch_manor_keyword_products() -> list[dict]:
 
 def check_manor() -> None:
     matching = fetch_manor_keyword_products()
-    print(f"[Manor] Keyword-Treffer (30th / 30 Jahre): {len(matching)}")
+    print(f"[Manor] Keyword-Treffer (30th / Delta): {len(matching)}")
     for p in matching:
         print(f"  · {p['title']} [{p.get('stock')}]")
 
@@ -464,10 +556,10 @@ def check_manor() -> None:
         if len(new_matches) == 1:
             subject = f"🏬 Manor: {new_matches[0]['title']}"
         else:
-            subject = f"🏬 Manor: {len(new_matches)} neue 30th/30-Jahre Treffer"
+            subject = f"🏬 Manor: {len(new_matches)} neue 30th/Delta-Treffer"
 
         lines = [
-            "Neue Pokémon-Treffer bei Manor (Suche: Pokemon, Filter: 30th / 30 Jahre):",
+            "Neue Pokémon-Treffer bei Manor (30th / Delta Reign / Delta Herrschaft):",
             "https://www.manor.ch/de/search?query=Pokemon",
             "",
         ]
@@ -608,7 +700,7 @@ def check_pokecard() -> None:
         ]
         for kind, p in alerts:
             mark = (
-                " [30th]"
+                " [PRIORITÄT]"
                 if matches_keywords(p["title"], POKECARD_PRIORITY_KEYWORDS)
                 else ""
             )
@@ -886,53 +978,53 @@ def fetch_sparkleaf_30th() -> list[dict]:
                 "available": available,
             }
 
-    # Search backup for newly tagged 30th products outside those collections.
-    q = urllib.parse.urlencode(
-        {
-            "q": "30th celebration",
-            "resources[type]": "product",
-            "resources[limit]": "20",
-            "resources[options][unavailable_products]": "last",
-        }
-    )
-    try:
-        data = _sparkleaf_get_json(
-            f"https://sparkleaf.ch/search/suggest.json?{q}"
-        )
-    except Exception as exc:  # noqa: BLE001
-        print(f"[SparkLeaf] Suche FEHLER: {exc}")
-        data = {}
-
-    products = (
-        ((data.get("resources") or {}).get("results") or {}).get("products")
-        or []
-        if isinstance(data, dict)
-        else []
-    )
-    for p in products:
-        title = p.get("title") or ""
-        if not matches_keywords(title, SPARKLEAF_KEYWORDS):
-            continue
-        pid = str(p.get("id") or p.get("handle") or title)
-        url = p.get("url") or ""
-        if url.startswith("/"):
-            url = f"https://sparkleaf.ch{url.split('?')[0]}"
-        by_id.setdefault(
-            pid,
+    for query in SPARKLEAF_SEARCH_QUERIES:
+        q = urllib.parse.urlencode(
             {
-                "id": pid,
-                "title": title,
-                "url": url or SPARKLEAF_DEALS_PAGE,
-                "available": bool(p.get("available")),
-            },
+                "q": query,
+                "resources[type]": "product",
+                "resources[limit]": "20",
+                "resources[options][unavailable_products]": "last",
+            }
         )
+        try:
+            data = _sparkleaf_get_json(
+                f"https://sparkleaf.ch/search/suggest.json?{q}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[SparkLeaf] Suche '{query}' FEHLER: {exc}")
+            continue
+
+        products = (
+            ((data.get("resources") or {}).get("results") or {}).get("products")
+            or []
+            if isinstance(data, dict)
+            else []
+        )
+        for p in products:
+            title = p.get("title") or ""
+            if not matches_keywords(title, SPARKLEAF_KEYWORDS):
+                continue
+            pid = str(p.get("id") or p.get("handle") or title)
+            url = p.get("url") or ""
+            if url.startswith("/"):
+                url = f"https://sparkleaf.ch{url.split('?')[0]}"
+            by_id.setdefault(
+                pid,
+                {
+                    "id": pid,
+                    "title": title,
+                    "url": url or SPARKLEAF_DEALS_PAGE,
+                    "available": bool(p.get("available")),
+                },
+            )
 
     return list(by_id.values())
 
 
 def check_sparkleaf() -> None:
     products = fetch_sparkleaf_30th()
-    print(f"[SparkLeaf] Gefunden: {len(products)} 30th-Produkte")
+    print(f"[SparkLeaf] Gefunden: {len(products)} 30th/Delta-Produkte")
 
     state = _sparkleaf_load_state()
     seen = set(state["product_ids"])
@@ -971,10 +1063,10 @@ def check_sparkleaf() -> None:
             kind, p = alerts[0]
             subject = f"🍃 SparkLeaf [{kind}]: {p['title']}"
         else:
-            subject = f"🍃 SparkLeaf: {len(alerts)} 30th-Updates"
+            subject = f"🍃 SparkLeaf: {len(alerts)} 30th/Delta-Updates"
 
         lines = [
-            "Updates bei SparkLeaf (30th / Pre-Order):",
+            "Updates bei SparkLeaf (30th / Delta Reign / Pre-Order):",
             SPARKLEAF_DEALS_PAGE,
             "",
         ]
@@ -985,7 +1077,7 @@ def check_sparkleaf() -> None:
             lines.append("")
         send_email(subject, "\n".join(lines))
     else:
-        print("[SparkLeaf] Keine neuen / wieder verfügbaren 30th-Produkte.")
+        print("[SparkLeaf] Keine neuen / wieder verfügbaren 30th/Delta-Produkte.")
 
     merged_avail = dict(prev_avail)
     merged_avail.update(current_avail)
@@ -1021,6 +1113,8 @@ def _ryu_fetch_all_collections() -> list[dict]:
 def _ryu_is_interesting_collection(handle: str, title: str) -> bool:
     blob = f"{handle} {title}".casefold()
     if "30th" in blob and ("celebrat" in blob or "annivers" in blob):
+        return True
+    if matches_keywords(blob, DELTA_KEYWORDS):
         return True
     if "pokemon" in blob and ("pre-order" in blob or "preorder" in blob):
         return True
@@ -1059,40 +1153,45 @@ def _ryu_collection_products(handle: str) -> list[dict]:
 
 
 def _ryu_search_30th_products() -> list[dict]:
-    """Catch 30th products even if not yet filed under the main collection."""
-    q = urllib.parse.urlencode(
-        {
-            "q": "30th",
-            "resources[type]": "product",
-            "resources[limit]": "10",
-            "resources[options][unavailable_products]": "last",
-        }
-    )
-    data = _ryu_get_json(f"https://ryu.land/search/suggest.json?{q}")
-    results = (
-        ((data.get("resources") or {}).get("results") or {}).get("products") or []
-    )
-    out = []
-    for p in results:
-        title = p.get("title") or ""
-        tags = [str(t).casefold() for t in (p.get("tags") or [])]
-        blob = f"{title} {' '.join(tags)}".casefold()
-        if "30th" not in blob:
-            continue
-        if not any(k in blob for k in ("pokemon", "pokémon", "pkm")):
-            continue
-        handle = p.get("handle") or ""
-        out.append(
+    """Catch 30th / Delta products even if not yet filed under the main collection."""
+    by_id: dict[str, dict] = {}
+    for query in RYU_SEARCH_QUERIES:
+        q = urllib.parse.urlencode(
             {
-                "id": str(p.get("id")),
+                "q": query,
+                "resources[type]": "product",
+                "resources[limit]": "10",
+                "resources[options][unavailable_products]": "last",
+            }
+        )
+        try:
+            data = _ryu_get_json(f"https://ryu.land/search/suggest.json?{q}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[Ryu] Suche '{query}' FEHLER: {exc}")
+            continue
+        results = (
+            ((data.get("resources") or {}).get("results") or {}).get("products")
+            or []
+        )
+        for p in results:
+            title = p.get("title") or ""
+            tags = [str(t).casefold() for t in (p.get("tags") or [])]
+            blob = f"{title} {' '.join(tags)}".casefold()
+            pokemonish = any(k in blob for k in ("pokemon", "pokémon", "pkm"))
+            watched = "30th" in blob or matches_keywords(blob, DELTA_KEYWORDS)
+            if not pokemonish or not watched:
+                continue
+            pid = str(p.get("id") or p.get("handle") or title)
+            handle = p.get("handle") or ""
+            by_id[pid] = {
+                "id": pid,
                 "title": title,
                 "handle": handle,
                 "url": f"https://ryu.land/products/{handle}",
                 "tags": p.get("tags") or [],
                 "available": bool(p.get("available")),
             }
-        )
-    return out
+    return list(by_id.values())
 
 
 def check_ryu() -> None:
@@ -1116,9 +1215,9 @@ def check_ryu() -> None:
         f"[Ryu] Collection {RYU_COLLECTION}: {len(collection_products)} Produkte"
     )
 
-    # 2) Search fallback for other 30th Pokémon products
+    # 2) Search fallback for other 30th / Delta Pokémon products
     search_products = _ryu_search_30th_products()
-    print(f"[Ryu] Search 30th Pokémon: {len(search_products)} Treffer")
+    print(f"[Ryu] Search 30th/Delta Pokémon: {len(search_products)} Treffer")
 
     by_id: dict[str, dict] = {}
     for p in collection_products + search_products:
@@ -1184,7 +1283,7 @@ def check_ryu() -> None:
             alerts.append("")
 
     if new_products:
-        alerts.append("Neue 30th-Produkte:")
+        alerts.append("Neue 30th/Delta-Produkte:")
         for p in new_products:
             alerts.append(f"- {p['title']}")
             alerts.append(f"  {p['url']}")
@@ -1218,7 +1317,7 @@ def check_ryu() -> None:
 
         body = "\n".join(
             [
-                "Update bei ryu.land (30th / Pre-Order Monitoring):",
+                "Update bei ryu.land (30th / Delta Reign / Pre-Order Monitoring):",
                 f"https://ryu.land/collections/{RYU_COLLECTION}",
                 "",
                 *alerts,
@@ -1389,10 +1488,10 @@ def check_brack() -> None:
         if len(new_matches) == 1:
             subject = f"🛒 Brack: {new_matches[0]['title']}"
         else:
-            subject = f"🛒 Brack: {len(new_matches)} neue 30th/Celebration-Treffer"
+            subject = f"🛒 Brack: {len(new_matches)} neue 30th/Delta-Treffer"
 
         lines = [
-            "Neue Treffer bei Brack (30th / 30 Jahre):",
+            "Neue Treffer bei Brack (30th / Delta Reign / Delta Herrschaft):",
             "https://www.brack.ch/",
             "",
         ]
@@ -1415,6 +1514,11 @@ def main() -> None:
         check_cardcollectors()
     except Exception as exc:  # noqa: BLE001
         print(f"[CardCollectors] FEHLER: {exc}")
+
+    try:
+        check_cardcollectors_delta()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[CardCollectors Delta] FEHLER: {exc}")
 
     try:
         check_manor()
