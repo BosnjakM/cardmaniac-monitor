@@ -63,6 +63,36 @@ POKECARD_PRIORITY_KEYWORDS = [
     "anniversaire",
 ]
 
+# --- The Mana Shop (Vorverkauf category: neu + wieder verfügbar) ---
+MANASHOP_SEEN = ROOT / "seen_manashop.json"
+MANASHOP_PAGE = "https://themanashop.ch/de/237-vorverkauf"
+MANASHOP_PRIORITY_KEYWORDS = [
+    "30th",
+    "30 jahre",
+    "30-jahre",
+    "celebration",
+    "pokemon",
+    "pokémon",
+]
+
+# --- SparkLeaf (Pre-Order / Deals, nur 30th) ---
+SPARKLEAF_SEEN = ROOT / "seen_sparkleaf.json"
+SPARKLEAF_DEALS_PAGE = (
+    "https://sparkleaf.ch/pages/pokemon-one-piece-tcg-pre-order-deals"
+)
+SPARKLEAF_COLLECTIONS = [
+    "pre-order",
+    "pokemon-one-piece-tcg-pre-order-deals",
+]
+SPARKLEAF_KEYWORDS = [
+    "30th",
+    "30 jahre",
+    "30-jahre",
+    "30th celebration",
+    "30th anniversary",
+    "celebration",
+]
+
 # --- Brack (notify only on keyword matches via public sitemaps) ---
 BRACK_SEEN = ROOT / "seen_brack.json"
 BRACK_STATE = ROOT / "brack_sitemap_state.json"
@@ -596,6 +626,372 @@ def check_pokecard() -> None:
     _pokecard_save_state(seen | current_ids, merged_avail)
 
 
+# ----- The Mana Shop (PrestaShop Vorverkauf) -----
+
+
+def _manashop_load_state() -> dict:
+    if not MANASHOP_SEEN.exists():
+        return {"product_ids": [], "availability": {}}
+    raw = json.loads(MANASHOP_SEEN.read_text(encoding="utf-8"))
+    return {
+        "product_ids": [str(x) for x in raw.get("product_ids", [])],
+        "availability": {
+            str(k): bool(v) for k, v in (raw.get("availability") or {}).items()
+        },
+    }
+
+
+def _manashop_save_state(product_ids: set[str], availability: dict[str, bool]) -> None:
+    MANASHOP_SEEN.write_text(
+        json.dumps(
+            {
+                "product_ids": sorted(product_ids),
+                "availability": {
+                    k: availability[k] for k in sorted(availability)
+                },
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _manashop_fetch_page(page: int) -> str:
+    url = MANASHOP_PAGE if page <= 1 else f"{MANASHOP_PAGE}?p={page}"
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=45) as resp:
+        return resp.read().decode("utf-8", errors="ignore")
+
+
+def _manashop_parse_products(html: str) -> list[dict]:
+    parts = html.split("ajax_block_product")
+    out: dict[str, dict] = {}
+    for body in parts[1:]:
+        m_id = re.search(r"/(\d+)-[^\"/]+\.html", body)
+        m_url = re.search(
+            r'href="(https://themanashop\.ch/de/[^"]+\.html)"', body
+        )
+        m_title = re.search(r'class="product-name"[^>]*title="([^"]+)"', body)
+        if not m_id or not m_url:
+            continue
+        available = "schema.org/OutOfStock" not in body
+        if "schema.org/InStock" in body:
+            available = True
+        elif "schema.org/OutOfStock" in body:
+            available = False
+        title = (m_title.group(1) if m_title else "").strip() or "(ohne Titel)"
+        pid = m_id.group(1)
+        out[pid] = {
+            "id": pid,
+            "title": html_lib.unescape(title),
+            "url": m_url.group(1),
+            "available": available,
+        }
+    return list(out.values())
+
+
+def fetch_manashop() -> list[dict]:
+    by_id: dict[str, dict] = {}
+    html1 = _manashop_fetch_page(1)
+    for p in _manashop_parse_products(html1):
+        by_id[p["id"]] = p
+
+    # Prefer "Es gibt 123 Artikel." (category), not cart snippets like "Es gibt 1 Artikel".
+    counts = [
+        int(x)
+        for x in re.findall(r"Es gibt\s+(\d+)\s+Artikel\.", html1, re.I)
+    ]
+    if not counts:
+        counts = [
+            int(x)
+            for x in re.findall(r"Es gibt\s+(\d+)\s+Artikel", html1, re.I)
+        ]
+    total = max(counts) if counts else len(by_id)
+    per_page = max(len(by_id), 1)
+    max_pages = min(25, max(1, (total + per_page - 1) // per_page))
+
+    if max_pages > 1:
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            futures = {
+                pool.submit(_manashop_fetch_page, page): page
+                for page in range(2, max_pages + 1)
+            }
+            for fut in as_completed(futures):
+                try:
+                    html = fut.result()
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[ManaShop] Seite {futures[fut]} FEHLER: {exc}")
+                    continue
+                for p in _manashop_parse_products(html):
+                    by_id[p["id"]] = p
+
+    # If still short, walk sequentially until a page adds nothing.
+    page = max_pages + 1
+    while page <= 25 and len(by_id) < total:
+        try:
+            html = _manashop_fetch_page(page)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[ManaShop] Seite {page} FEHLER: {exc}")
+            break
+        before = len(by_id)
+        for p in _manashop_parse_products(html):
+            by_id[p["id"]] = p
+        if len(by_id) == before:
+            break
+        page += 1
+
+    return list(by_id.values())
+
+
+def check_manashop() -> None:
+    products = fetch_manashop()
+    print(f"[ManaShop] Gefunden: {len(products)} Vorverkauf-Artikel")
+
+    state = _manashop_load_state()
+    seen = set(state["product_ids"])
+    prev_avail = state["availability"]
+    current_ids = {p["id"] for p in products}
+    current_avail = {p["id"]: p["available"] for p in products}
+
+    if not seen:
+        _manashop_save_state(current_ids, current_avail)
+        print("[ManaShop] Erster Lauf: seen_manashop.json initialisiert, keine Mail.")
+        return
+
+    new_products = [p for p in products if p["id"] not in seen]
+    restocked = [
+        p
+        for p in products
+        if p["id"] in prev_avail
+        and prev_avail.get(p["id"]) is False
+        and p["available"]
+    ]
+
+    alerts: list[tuple[str, dict]] = []
+    for p in new_products:
+        alerts.append(("NEU", p))
+    for p in restocked:
+        alerts.append(("WIEDER VERFÜGBAR", p))
+
+    if alerts:
+        print("[ManaShop] Alert:")
+        for kind, p in alerts:
+            print(f"  - [{kind}] {p['title']}")
+
+        priority = [
+            p
+            for _, p in alerts
+            if matches_keywords(p["title"], MANASHOP_PRIORITY_KEYWORDS)
+        ]
+        if priority:
+            subject = f"🎯 ManaShop PRIORITÄT: {priority[0]['title']}"
+            if len(alerts) > 1:
+                subject += f" (+{len(alerts) - 1} weitere)"
+        elif len(alerts) == 1:
+            kind, p = alerts[0]
+            subject = f"🆕 ManaShop [{kind}]: {p['title']}"
+        else:
+            subject = f"🆕 ManaShop: {len(alerts)} Vorverkauf-Updates"
+
+        lines = [
+            "Updates bei The Mana Shop Vorverkauf:",
+            MANASHOP_PAGE,
+            "",
+        ]
+        for kind, p in alerts:
+            mark = (
+                " [PRIORITÄT]"
+                if matches_keywords(p["title"], MANASHOP_PRIORITY_KEYWORDS)
+                else ""
+            )
+            stock = "verfügbar" if p["available"] else "ausverkauft"
+            lines.append(f"- [{kind}] {p['title']}{mark} ({stock})")
+            lines.append(f"  {p['url']}")
+            lines.append("")
+        send_email(subject, "\n".join(lines))
+    else:
+        print("[ManaShop] Keine neuen / wieder verfügbaren Produkte.")
+
+    merged_avail = dict(prev_avail)
+    merged_avail.update(current_avail)
+    _manashop_save_state(seen | current_ids, merged_avail)
+
+
+# ----- SparkLeaf (30th only) -----
+
+
+def _sparkleaf_load_state() -> dict:
+    if not SPARKLEAF_SEEN.exists():
+        return {"product_ids": [], "availability": {}}
+    raw = json.loads(SPARKLEAF_SEEN.read_text(encoding="utf-8"))
+    return {
+        "product_ids": [str(x) for x in raw.get("product_ids", [])],
+        "availability": {
+            str(k): bool(v) for k, v in (raw.get("availability") or {}).items()
+        },
+    }
+
+
+def _sparkleaf_save_state(
+    product_ids: set[str], availability: dict[str, bool]
+) -> None:
+    SPARKLEAF_SEEN.write_text(
+        json.dumps(
+            {
+                "product_ids": sorted(product_ids),
+                "availability": {
+                    k: availability[k] for k in sorted(availability)
+                },
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _sparkleaf_get_json(url: str) -> dict | list:
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.load(resp)
+
+
+def fetch_sparkleaf_30th() -> list[dict]:
+    by_id: dict[str, dict] = {}
+
+    for handle in SPARKLEAF_COLLECTIONS:
+        data = _sparkleaf_get_json(
+            f"https://sparkleaf.ch/collections/{handle}/products.json?limit=250"
+        )
+        for p in data.get("products", []) if isinstance(data, dict) else []:
+            title = p.get("title") or ""
+            if not matches_keywords(title, SPARKLEAF_KEYWORDS):
+                continue
+            handle_p = p.get("handle") or ""
+            available = any(
+                bool(v.get("available")) for v in p.get("variants", [])
+            )
+            pid = str(p["id"])
+            by_id[pid] = {
+                "id": pid,
+                "title": title,
+                "url": (
+                    f"https://sparkleaf.ch/products/{handle_p}"
+                    if handle_p
+                    else SPARKLEAF_DEALS_PAGE
+                ),
+                "available": available,
+            }
+
+    # Search backup for newly tagged 30th products outside those collections.
+    q = urllib.parse.urlencode(
+        {
+            "q": "30th celebration",
+            "resources[type]": "product",
+            "resources[limit]": "20",
+            "resources[options][unavailable_products]": "last",
+        }
+    )
+    try:
+        data = _sparkleaf_get_json(
+            f"https://sparkleaf.ch/search/suggest.json?{q}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[SparkLeaf] Suche FEHLER: {exc}")
+        data = {}
+
+    products = (
+        ((data.get("resources") or {}).get("results") or {}).get("products")
+        or []
+        if isinstance(data, dict)
+        else []
+    )
+    for p in products:
+        title = p.get("title") or ""
+        if not matches_keywords(title, SPARKLEAF_KEYWORDS):
+            continue
+        pid = str(p.get("id") or p.get("handle") or title)
+        url = p.get("url") or ""
+        if url.startswith("/"):
+            url = f"https://sparkleaf.ch{url.split('?')[0]}"
+        by_id.setdefault(
+            pid,
+            {
+                "id": pid,
+                "title": title,
+                "url": url or SPARKLEAF_DEALS_PAGE,
+                "available": bool(p.get("available")),
+            },
+        )
+
+    return list(by_id.values())
+
+
+def check_sparkleaf() -> None:
+    products = fetch_sparkleaf_30th()
+    print(f"[SparkLeaf] Gefunden: {len(products)} 30th-Produkte")
+
+    state = _sparkleaf_load_state()
+    seen = set(state["product_ids"])
+    prev_avail = state["availability"]
+    current_ids = {p["id"] for p in products}
+    current_avail = {p["id"]: p["available"] for p in products}
+
+    if not seen:
+        _sparkleaf_save_state(current_ids, current_avail)
+        print(
+            "[SparkLeaf] Erster Lauf: seen_sparkleaf.json initialisiert, keine Mail."
+        )
+        return
+
+    new_products = [p for p in products if p["id"] not in seen]
+    restocked = [
+        p
+        for p in products
+        if p["id"] in prev_avail
+        and prev_avail.get(p["id"]) is False
+        and p["available"]
+    ]
+
+    alerts: list[tuple[str, dict]] = []
+    for p in new_products:
+        alerts.append(("NEU", p))
+    for p in restocked:
+        alerts.append(("WIEDER VERFÜGBAR", p))
+
+    if alerts:
+        print("[SparkLeaf] Alert:")
+        for kind, p in alerts:
+            print(f"  - [{kind}] {p['title']}")
+
+        if len(alerts) == 1:
+            kind, p = alerts[0]
+            subject = f"🍃 SparkLeaf [{kind}]: {p['title']}"
+        else:
+            subject = f"🍃 SparkLeaf: {len(alerts)} 30th-Updates"
+
+        lines = [
+            "Updates bei SparkLeaf (30th / Pre-Order):",
+            SPARKLEAF_DEALS_PAGE,
+            "",
+        ]
+        for kind, p in alerts:
+            stock = "verfügbar" if p["available"] else "ausverkauft"
+            lines.append(f"- [{kind}] {p['title']} ({stock})")
+            lines.append(f"  {p['url']}")
+            lines.append("")
+        send_email(subject, "\n".join(lines))
+    else:
+        print("[SparkLeaf] Keine neuen / wieder verfügbaren 30th-Produkte.")
+
+    merged_avail = dict(prev_avail)
+    merged_avail.update(current_avail)
+    _sparkleaf_save_state(seen | current_ids, merged_avail)
+
+
 # ----- Ryu.land -----
 
 
@@ -1034,6 +1430,16 @@ def main() -> None:
         check_pokecard()
     except Exception as exc:  # noqa: BLE001
         print(f"[Pokecard] FEHLER: {exc}")
+
+    try:
+        check_manashop()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[ManaShop] FEHLER: {exc}")
+
+    try:
+        check_sparkleaf()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[SparkLeaf] FEHLER: {exc}")
 
     # Brack is often blocked from GitHub cloud — only run when forced.
     if FORCE_BRACK_SCAN:

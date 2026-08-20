@@ -9,6 +9,8 @@ Alerts gehen an die Adresse in GitHub Secret `MAIL_TO` (nicht öffentlich).
 | **Manor** | Suche Pokemon → 30th / 30 Jahre | aktiv |
 | **Ryu.land** | 30th Celebration Collection / Pre-Orders | aktiv |
 | **Pokecard** | [Vorbestellungen](https://pokecard.store/collections/vorbestellung) neu + Restock | aktiv |
+| **ManaShop** | [Vorverkauf](https://themanashop.ch/de/237-vorverkauf) neu + Restock | aktiv |
+| **SparkLeaf** | Pre-Order/Deals, nur **30th** neu + Restock | aktiv |
 | **Brack** | oft blockiert → Google Alert | teils |
 
 ## Wichtig: zuverlässiger Timer
