@@ -366,6 +366,8 @@ def check_ricardo(send_email) -> None:
     print(f"[Ricardo] Deals im 30-Min-Fenster: {len(deals)}")
 
     seen = _load_seen()
+    if not RICARDO_SEEN.exists():
+        _save_seen(seen)
     fresh = [d for d in deals if d["id"] not in seen]
     for d in deals:
         print(
