@@ -42,7 +42,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add seen.json seen_brack.json brack_sitemap_state.json stock_cardcollectors.json seen_cardcollectors_search.json seen_manor.json seen_ryu.json seen_pokecard.json seen_manashop.json seen_sparkleaf.json
+          git add seen.json seen_brack.json brack_sitemap_state.json stock_cardcollectors.json seen_cardcollectors_search.json seen_manor.json seen_ryu.json seen_pokecard.json seen_manashop.json seen_sparkleaf.json seen_ricardo.json
           if git diff --staged --quiet; then
             echo "Keine Änderung an State-Dateien"
           else
