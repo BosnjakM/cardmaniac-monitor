@@ -2,4 +2,3 @@
 .env
 *.pyc
 __pycache__/
-price_cache.json

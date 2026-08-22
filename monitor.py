@@ -1545,13 +1545,6 @@ def main() -> None:
     except Exception as exc:  # noqa: BLE001
         print(f"[SparkLeaf] FEHLER: {exc}")
 
-    try:
-        from ricardo import check_ricardo
-
-        check_ricardo(send_email)
-    except Exception as exc:  # noqa: BLE001
-        print(f"[Ricardo] FEHLER: {exc}")
-
     # Brack is often blocked from GitHub cloud — only run when forced.
     if FORCE_BRACK_SCAN:
         try:
