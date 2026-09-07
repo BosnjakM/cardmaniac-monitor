@@ -137,6 +137,9 @@ BRACK_URL_KEYWORDS = [
 # Highlight these on Cardmaniac (still notifies on all new products there)
 CARDMANIAC_PRIORITY_KEYWORDS = [
     "30th celebration",
+    "30th",
+    "30 jahre",
+    "30-jahre",
     "tech-sticker",
     "tech sticker",
     "sticker-kollektion",
@@ -218,6 +221,7 @@ def fetch_cardmaniac() -> list[dict]:
     products = []
     for p in data.get("products", []):
         handle = p.get("handle", "")
+        available = any(bool(v.get("available")) for v in p.get("variants", []))
         products.append(
             {
                 "id": str(p["id"]),
@@ -227,63 +231,120 @@ def fetch_cardmaniac() -> list[dict]:
                     if handle
                     else CARDMANIAC_PAGE
                 ),
+                "available": available,
                 "shop": "Cardmaniac",
             }
         )
     return products
 
 
+def _cardmaniac_load_state() -> dict:
+    if not CARDMANIAC_SEEN.exists():
+        return {"product_ids": [], "availability": {}, "initialized": False}
+    raw = json.loads(CARDMANIAC_SEEN.read_text(encoding="utf-8"))
+    return {
+        "product_ids": [str(x) for x in raw.get("product_ids", [])],
+        "availability": {
+            str(k): bool(v) for k, v in (raw.get("availability") or {}).items()
+        },
+        "initialized": bool(raw.get("initialized")) or bool(raw.get("product_ids")),
+    }
+
+
+def _cardmaniac_save_state(
+    product_ids: set[str], availability: dict[str, bool]
+) -> None:
+    CARDMANIAC_SEEN.write_text(
+        json.dumps(
+            {
+                "product_ids": sorted(product_ids),
+                "availability": {k: availability[k] for k in sorted(availability)},
+                "initialized": True,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def check_cardmaniac() -> None:
     products = fetch_cardmaniac()
     print(f"[Cardmaniac] Gefunden: {len(products)} Produkte")
 
-    seen = load_seen(CARDMANIAC_SEEN)
+    state = _cardmaniac_load_state()
+    seen = set(state["product_ids"])
+    prev_avail = state["availability"]
     current_ids = {p["id"] for p in products}
+    current_avail = {p["id"]: p["available"] for p in products}
 
-    if not seen:
-        save_seen(CARDMANIAC_SEEN, current_ids)
+    # Only skip mail on the very first seed (file missing / never initialized).
+    # NEVER treat an empty list after a wipe as "first run" — that missed the
+    # 30 Jahre drop on 2026-09-03 when pre-order was briefly empty.
+    if not state["initialized"]:
+        _cardmaniac_save_state(current_ids, current_avail)
         print("[Cardmaniac] Erster Lauf: seen.json initialisiert, keine Mail.")
         return
 
     new_products = [p for p in products if p["id"] not in seen]
-    if new_products:
-        print("[Cardmaniac] Neu:")
-        for p in new_products:
-            print(f"  - {p['title']}")
+    restocked = [
+        p
+        for p in products
+        if p["id"] in prev_avail
+        and prev_avail.get(p["id"]) is False
+        and p["available"]
+    ]
+
+    alerts: list[tuple[str, dict]] = []
+    for p in new_products:
+        alerts.append(("NEU", p))
+    for p in restocked:
+        alerts.append(("WIEDER VERFÜGBAR", p))
+
+    if alerts:
+        print("[Cardmaniac] Alert:")
+        for kind, p in alerts:
+            print(f"  - [{kind}] {p['title']}")
 
         priority = [
             p
-            for p in new_products
+            for _, p in alerts
             if matches_keywords(p["title"], CARDMANIAC_PRIORITY_KEYWORDS)
         ]
         if priority:
             subject = f"🎯 Cardmaniac PRIORITÄT: {priority[0]['title']}"
-            if len(new_products) > 1:
-                subject += f" (+{len(new_products) - 1} weitere)"
-        elif len(new_products) == 1:
-            subject = f"🆕 Cardmaniac: {new_products[0]['title']}"
+            if len(alerts) > 1:
+                subject += f" (+{len(alerts) - 1} weitere)"
+        elif len(alerts) == 1:
+            kind, p = alerts[0]
+            subject = f"🆕 Cardmaniac [{kind}]: {p['title']}"
         else:
-            subject = f"🆕 Cardmaniac: {len(new_products)} neue Pre-Order Produkte"
+            subject = f"🆕 Cardmaniac: {len(alerts)} Pre-Order-Updates"
 
         lines = [
-            "Neue Produkte bei Cardmaniac Pre-Order:",
+            "Updates bei Cardmaniac Pre-Order:",
             CARDMANIAC_PAGE,
             "",
         ]
-        for p in new_products:
+        for kind, p in alerts:
             mark = (
                 " [PRIORITÄT]"
                 if matches_keywords(p["title"], CARDMANIAC_PRIORITY_KEYWORDS)
                 else ""
             )
-            lines.append(f"- {p['title']}{mark}")
+            stock = "verfügbar" if p["available"] else "ausverkauft/preorder"
+            lines.append(f"- [{kind}] {p['title']}{mark} ({stock})")
             lines.append(f"  {p['url']}")
             lines.append("")
         send_email(subject, "\n".join(lines))
     else:
-        print("[Cardmaniac] Keine neuen Produkte.")
+        print("[Cardmaniac] Keine neuen / wieder verfügbaren Produkte.")
 
-    save_seen(CARDMANIAC_SEEN, current_ids)
+    # Keep history even if the collection goes empty (critical).
+    merged_avail = dict(prev_avail)
+    merged_avail.update(current_avail)
+    _cardmaniac_save_state(seen | current_ids, merged_avail)
 
 
 # ----- CardCollectors (stock watch) -----
@@ -592,13 +653,16 @@ def check_manor() -> None:
 
 def _pokecard_load_state() -> dict:
     if not POKECARD_SEEN.exists():
-        return {"product_ids": [], "availability": {}}
+        return {"product_ids": [], "availability": {}, "initialized": False}
     raw = json.loads(POKECARD_SEEN.read_text(encoding="utf-8"))
     return {
         "product_ids": [str(x) for x in raw.get("product_ids", [])],
         "availability": {
             str(k): bool(v) for k, v in (raw.get("availability") or {}).items()
         },
+        "initialized": bool(raw.get("initialized"))
+        or bool(raw.get("product_ids"))
+        or bool(raw.get("availability")),
     }
 
 
@@ -610,6 +674,7 @@ def _pokecard_save_state(product_ids: set[str], availability: dict[str, bool]) -
                 "availability": {
                     k: availability[k] for k in sorted(availability)
                 },
+                "initialized": True,
             },
             indent=2,
             ensure_ascii=False,
@@ -653,7 +718,7 @@ def check_pokecard() -> None:
     current_ids = {p["id"] for p in products}
     current_avail = {p["id"]: p["available"] for p in products}
 
-    if not seen:
+    if not state["initialized"]:
         _pokecard_save_state(current_ids, current_avail)
         print("[Pokecard] Erster Lauf: seen_pokecard.json initialisiert, keine Mail.")
         return
@@ -723,13 +788,16 @@ def check_pokecard() -> None:
 
 def _manashop_load_state() -> dict:
     if not MANASHOP_SEEN.exists():
-        return {"product_ids": [], "availability": {}}
+        return {"product_ids": [], "availability": {}, "initialized": False}
     raw = json.loads(MANASHOP_SEEN.read_text(encoding="utf-8"))
     return {
         "product_ids": [str(x) for x in raw.get("product_ids", [])],
         "availability": {
             str(k): bool(v) for k, v in (raw.get("availability") or {}).items()
         },
+        "initialized": bool(raw.get("initialized"))
+        or bool(raw.get("product_ids"))
+        or bool(raw.get("availability")),
     }
 
 
@@ -741,6 +809,7 @@ def _manashop_save_state(product_ids: set[str], availability: dict[str, bool]) -
                 "availability": {
                     k: availability[k] for k in sorted(availability)
                 },
+                "initialized": True,
             },
             indent=2,
             ensure_ascii=False,
@@ -847,7 +916,7 @@ def check_manashop() -> None:
     current_ids = {p["id"] for p in products}
     current_avail = {p["id"]: p["available"] for p in products}
 
-    if not seen:
+    if not state["initialized"]:
         _manashop_save_state(current_ids, current_avail)
         print("[ManaShop] Erster Lauf: seen_manashop.json initialisiert, keine Mail.")
         return
@@ -916,13 +985,16 @@ def check_manashop() -> None:
 
 def _sparkleaf_load_state() -> dict:
     if not SPARKLEAF_SEEN.exists():
-        return {"product_ids": [], "availability": {}}
+        return {"product_ids": [], "availability": {}, "initialized": False}
     raw = json.loads(SPARKLEAF_SEEN.read_text(encoding="utf-8"))
     return {
         "product_ids": [str(x) for x in raw.get("product_ids", [])],
         "availability": {
             str(k): bool(v) for k, v in (raw.get("availability") or {}).items()
         },
+        "initialized": bool(raw.get("initialized"))
+        or bool(raw.get("product_ids"))
+        or bool(raw.get("availability")),
     }
 
 
@@ -936,6 +1008,7 @@ def _sparkleaf_save_state(
                 "availability": {
                     k: availability[k] for k in sorted(availability)
                 },
+                "initialized": True,
             },
             indent=2,
             ensure_ascii=False,
@@ -1032,7 +1105,7 @@ def check_sparkleaf() -> None:
     current_ids = {p["id"] for p in products}
     current_avail = {p["id"]: p["available"] for p in products}
 
-    if not seen:
+    if not state["initialized"]:
         _sparkleaf_save_state(current_ids, current_avail)
         print(
             "[SparkLeaf] Erster Lauf: seen_sparkleaf.json initialisiert, keine Mail."
