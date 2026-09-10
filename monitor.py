@@ -464,7 +464,7 @@ def fetch_cardcollectors_search(query: str) -> list[dict]:
 
 
 def check_cardcollectors_delta() -> None:
-    """Notify when Delta Reign / Delta Herrschaft products first appear."""
+    """Notify when Delta Reign / Delta Herrschaft products appear or restock."""
     by_id: dict[str, dict] = {}
     for query in CARDCOLLECTORS_SEARCH_QUERIES:
         try:
@@ -477,31 +477,104 @@ def check_cardcollectors_delta() -> None:
     for p in by_id.values():
         print(f"  · {p['title']}")
 
-    seen = load_seen(CARDCOLLECTORS_SEARCH_SEEN)
-    current_ids = set(by_id)
-    new_products = [by_id[i] for i in current_ids if i not in seen]
+    raw: dict = {"product_ids": [], "availability": {}, "initialized": False}
+    if CARDCOLLECTORS_SEARCH_SEEN.exists():
+        try:
+            loaded = json.loads(
+                CARDCOLLECTORS_SEARCH_SEEN.read_text(encoding="utf-8")
+            )
+            if isinstance(loaded, dict) and "product_ids" in loaded:
+                raw = loaded
+            else:
+                # Very old shapes — fall back to load_seen helper.
+                raw = {
+                    "product_ids": list(load_seen(CARDCOLLECTORS_SEARCH_SEEN)),
+                    "availability": {},
+                    "initialized": True,
+                }
+        except Exception:  # noqa: BLE001
+            raw = {
+                "product_ids": list(load_seen(CARDCOLLECTORS_SEARCH_SEEN)),
+                "availability": {},
+                "initialized": True,
+            }
 
-    if new_products:
-        if len(new_products) == 1:
-            subject = f"🛒 CardCollectors DELTA: {new_products[0]['title']}"
+    seen = {str(x) for x in raw.get("product_ids", [])}
+    prev_avail = {
+        str(k): bool(v) for k, v in (raw.get("availability") or {}).items()
+    }
+    initialized = bool(raw.get("initialized")) or bool(seen) or bool(prev_avail)
+    current_ids = set(by_id)
+    current_avail = {pid: bool(p.get("in_stock")) for pid, p in by_id.items()}
+
+    if not initialized:
+        CARDCOLLECTORS_SEARCH_SEEN.write_text(
+            json.dumps(
+                {
+                    "product_ids": sorted(current_ids),
+                    "availability": {
+                        k: current_avail[k] for k in sorted(current_avail)
+                    },
+                    "initialized": True,
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        print("[CardCollectors] Delta: Erster Lauf, keine Mail.")
+        return
+
+    new_products = [by_id[i] for i in current_ids if i not in seen]
+    restocked = [
+        by_id[i]
+        for i in current_ids
+        if i in prev_avail and prev_avail.get(i) is False and current_avail.get(i)
+    ]
+
+    alerts: list[tuple[str, dict]] = []
+    for p in new_products:
+        alerts.append(("NEU", p))
+    for p in restocked:
+        alerts.append(("WIEDER VERFÜGBAR", p))
+
+    if alerts:
+        if len(alerts) == 1:
+            kind, p = alerts[0]
+            subject = f"🛒 CardCollectors DELTA [{kind}]: {p['title']}"
         else:
             subject = (
-                f"🛒 CardCollectors: {len(new_products)} neue Delta-Reign-Produkte"
+                f"🛒 CardCollectors: {len(alerts)} Delta-Reign-Updates"
             )
         lines = [
-            "Neue Delta Reign / Delta Herrschaft Produkte bei CardCollectors:",
+            "Delta Reign / Delta Herrschaft Updates bei CardCollectors:",
             "",
         ]
-        for p in new_products:
+        for kind, p in alerts:
             stock = "In den Warenkorb" if p.get("in_stock") else "Nicht vorrätig"
-            lines.append(f"- {p['title']} ({stock})")
+            lines.append(f"- [{kind}] {p['title']} ({stock})")
             lines.append(f"  {p['url']}")
             lines.append("")
         send_email(subject, "\n".join(lines))
     else:
-        print("[CardCollectors] Keine neuen Delta-Produkte.")
+        print("[CardCollectors] Keine neuen / wieder verfügbaren Delta-Produkte.")
 
-    save_seen(CARDCOLLECTORS_SEARCH_SEEN, seen | current_ids)
+    merged_avail = dict(prev_avail)
+    merged_avail.update(current_avail)
+    CARDCOLLECTORS_SEARCH_SEEN.write_text(
+        json.dumps(
+            {
+                "product_ids": sorted(seen | current_ids),
+                "availability": {k: merged_avail[k] for k in sorted(merged_avail)},
+                "initialized": True,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 # ----- Manor -----
@@ -587,18 +660,34 @@ def check_manor() -> None:
     for p in matching:
         print(f"  · {p['title']} [{p.get('stock')}]")
 
-    raw: dict = {"product_ids": [], "initialized": False}
+    raw: dict = {
+        "product_ids": [],
+        "availability": {},
+        "initialized": False,
+    }
     if MANOR_SEEN.exists():
         raw = json.loads(MANOR_SEEN.read_text(encoding="utf-8"))
 
     seen = {str(x) for x in raw.get("product_ids", [])}
-    initialized = bool(raw.get("initialized"))
+    prev_avail = {
+        str(k): bool(v) for k, v in (raw.get("availability") or {}).items()
+    }
+    initialized = bool(raw.get("initialized")) or bool(seen) or bool(prev_avail)
     match_ids = {p["id"] for p in matching}
+    current_avail = {
+        p["id"]: str(p.get("stock") or "").upper() == "IN_STOCK" for p in matching
+    }
 
     if not initialized:
         MANOR_SEEN.write_text(
             json.dumps(
-                {"product_ids": sorted(match_ids), "initialized": True},
+                {
+                    "product_ids": sorted(match_ids),
+                    "availability": {
+                        k: current_avail[k] for k in sorted(current_avail)
+                    },
+                    "initialized": True,
+                },
                 indent=2,
                 ensure_ascii=False,
             )
@@ -609,35 +698,54 @@ def check_manor() -> None:
         return
 
     new_matches = [p for p in matching if p["id"] not in seen]
-    if new_matches:
-        print("[Manor] NEUE Treffer:")
-        for p in new_matches:
-            print(f"  - {p['title']}")
+    restocked = [
+        p
+        for p in matching
+        if p["id"] in prev_avail
+        and prev_avail.get(p["id"]) is False
+        and current_avail.get(p["id"]) is True
+    ]
 
-        if len(new_matches) == 1:
-            subject = f"🏬 Manor: {new_matches[0]['title']}"
+    alerts: list[tuple[str, dict]] = []
+    for p in new_matches:
+        alerts.append(("NEU", p))
+    for p in restocked:
+        alerts.append(("WIEDER VERFÜGBAR", p))
+
+    if alerts:
+        print("[Manor] Alert:")
+        for kind, p in alerts:
+            print(f"  - [{kind}] {p['title']} [{p.get('stock')}]")
+
+        if len(alerts) == 1:
+            kind, p = alerts[0]
+            subject = f"🏬 Manor [{kind}]: {p['title']}"
         else:
-            subject = f"🏬 Manor: {len(new_matches)} neue 30th/Delta-Treffer"
+            subject = f"🏬 Manor: {len(alerts)} 30th/Delta-Updates"
 
         lines = [
-            "Neue Pokémon-Treffer bei Manor (30th / Delta Reign / Delta Herrschaft):",
+            "Updates bei Manor (30th / Delta Reign / Delta Herrschaft):",
             "https://www.manor.ch/de/search?query=Pokemon",
             "",
         ]
-        for p in new_matches:
-            lines.append(f"- {p['title']}")
+        for kind, p in alerts:
+            stock = p.get("stock") or (
+                "IN_STOCK" if current_avail.get(p["id"]) else "OUT_OF_STOCK"
+            )
+            lines.append(f"- [{kind}] {p['title']} ({stock})")
             lines.append(f"  {p['url']}")
-            if p.get("stock"):
-                lines.append(f"  Status: {p['stock']}")
             lines.append("")
         send_email(subject, "\n".join(lines))
     else:
-        print("[Manor] Keine neuen Keyword-Treffer.")
+        print("[Manor] Keine neuen / wieder verfügbaren Keyword-Treffer.")
 
+    merged_avail = dict(prev_avail)
+    merged_avail.update(current_avail)
     MANOR_SEEN.write_text(
         json.dumps(
             {
                 "product_ids": sorted(seen | match_ids),
+                "availability": {k: merged_avail[k] for k in sorted(merged_avail)},
                 "initialized": True,
             },
             indent=2,
@@ -1549,39 +1657,116 @@ def check_brack() -> None:
     for p in matching:
         print(f"  · {p['title']}")
 
-    seen = load_seen(BRACK_SEEN)
+    raw: dict = {"product_ids": [], "presence": {}, "initialized": False}
+    if BRACK_SEEN.exists():
+        try:
+            loaded = json.loads(BRACK_SEEN.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict) and "product_ids" in loaded:
+                raw = loaded
+            else:
+                raw = {
+                    "product_ids": list(load_seen(BRACK_SEEN)),
+                    "presence": {},
+                    "initialized": True,
+                }
+        except Exception:  # noqa: BLE001
+            raw = {
+                "product_ids": list(load_seen(BRACK_SEEN)),
+                "presence": {},
+                "initialized": True,
+            }
+
+    seen = {str(x) for x in raw.get("product_ids", [])}
+    prev_presence = {
+        str(k): bool(v) for k, v in (raw.get("presence") or {}).items()
+    }
+    initialized = bool(raw.get("initialized")) or bool(seen) or bool(prev_presence)
     match_ids = {p["id"] for p in matching}
-    new_matches = [p for p in matching if p["id"] not in seen]
+    # Presence: currently in sitemap keyword hits
+    current_presence = {pid: True for pid in match_ids}
+    # Mark previously known IDs absent if missing this scan
+    for pid in seen:
+        current_presence.setdefault(pid, False)
 
-    if new_matches:
-        print("[Brack] NEUE Keyword-Treffer:")
-        for p in new_matches:
-            print(f"  - {p['title']}")
+    if not initialized:
+        BRACK_SEEN.write_text(
+            json.dumps(
+                {
+                    "product_ids": sorted(match_ids),
+                    "presence": {k: current_presence[k] for k in sorted(current_presence)},
+                    "initialized": True,
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        _save_brack_state({"fingerprint": fingerprint})
+        print("[Brack] Erster Lauf: State gespeichert, keine Mail.")
+        return
 
-        if len(new_matches) == 1:
-            subject = f"🛒 Brack: {new_matches[0]['title']}"
+    by_id = {p["id"]: p for p in matching}
+    new_matches = [by_id[i] for i in match_ids if i not in seen]
+    reappeared = [
+        by_id[i]
+        for i in match_ids
+        if i in prev_presence and prev_presence.get(i) is False
+    ]
+
+    alerts: list[tuple[str, dict]] = []
+    for p in new_matches:
+        alerts.append(("NEU", p))
+    for p in reappeared:
+        alerts.append(("WIEDER IN SITEMAP", p))
+
+    if alerts:
+        print("[Brack] Alert:")
+        for kind, p in alerts:
+            print(f"  - [{kind}] {p['title']}")
+
+        if len(alerts) == 1:
+            kind, p = alerts[0]
+            subject = f"🛒 Brack [{kind}]: {p['title']}"
         else:
-            subject = f"🛒 Brack: {len(new_matches)} neue 30th/Delta-Treffer"
+            subject = f"🛒 Brack: {len(alerts)} 30th/Delta-Updates"
 
         lines = [
-            "Neue Treffer bei Brack (30th / Delta Reign / Delta Herrschaft):",
+            "Updates bei Brack (30th / Delta Reign / Delta Herrschaft):",
             "https://www.brack.ch/",
             "",
         ]
-        for p in new_matches:
-            lines.append(f"- {p['title']}")
+        for kind, p in alerts:
+            lines.append(f"- [{kind}] {p['title']}")
             lines.append(f"  {p['url']}")
             lines.append("")
         send_email(subject, "\n".join(lines))
     else:
-        print("[Brack] Keine neuen Keyword-Treffer.")
+        print("[Brack] Keine neuen / wieder auftauchenden Keyword-Treffer.")
 
-    save_seen(BRACK_SEEN, seen | match_ids)
+    merged_presence = dict(prev_presence)
+    merged_presence.update(current_presence)
+    BRACK_SEEN.write_text(
+        json.dumps(
+            {
+                "product_ids": sorted(seen | match_ids),
+                "presence": {k: merged_presence[k] for k in sorted(merged_presence)},
+                "initialized": True,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     _save_brack_state({"fingerprint": fingerprint})
 
 
 def main() -> None:
-    check_cardmaniac()
+    try:
+        check_cardmaniac()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[Cardmaniac] FEHLER: {exc}")
 
     try:
         check_cardcollectors()
