@@ -24,12 +24,11 @@ CARDMANIAC_URL = "https://cardmaniac.ch/collections/pre-order/products.json"
 CARDMANIAC_PAGE = "https://cardmaniac.ch/collections/pre-order"
 CARDMANIAC_SEEN = ROOT / "seen.json"
 
-# --- CardCollectors (notify when watched products become in stock) ---
+# --- CardCollectors (watchlist stock + search for 30th / Delta listings) ---
 CARDCOLLECTORS_WATCHLIST = ROOT / "watchlist_cardcollectors.json"
 CARDCOLLECTORS_STOCK = ROOT / "stock_cardcollectors.json"
 CARDCOLLECTORS_SEARCH_SEEN = ROOT / "seen_cardcollectors_search.json"
 CARDCOLLECTORS_API = "https://cardcollectors.ch/wp-json/wc/store/v1/products"
-CARDCOLLECTORS_SEARCH_QUERIES = ["Delta Reign", "Delta Herrschaft"]
 
 DELTA_KEYWORDS = [
     "delta reign",
@@ -38,6 +37,28 @@ DELTA_KEYWORDS = [
     "delta herrschaft",
     "delta-herrschaft",
     "deltaherrschaft",
+]
+
+CARDCOLLECTORS_SEARCH_QUERIES = [
+    "30th Celebration",
+    "30 Jahre",
+    "Delta Reign",
+    "Delta Herrschaft",
+]
+CARDCOLLECTORS_SEARCH_KEYWORDS = [
+    "30th",
+    "30 jahre",
+    "30-jahre",
+    "celebration",
+    *DELTA_KEYWORDS,
+]
+# Skip event/menu noise from CardCollectors search results.
+CARDCOLLECTORS_SEARCH_SKIP = [
+    "community break",
+    "special menu",
+    "nachschlag",
+    "max 1",
+    "max. 1",
 ]
 
 # --- Manor (Pokemon search → 30th / 30 Jahre / Delta Reign) ---
@@ -442,12 +463,14 @@ def fetch_cardcollectors_search(query: str) -> list[dict]:
     params = urllib.parse.urlencode({"search": query, "per_page": "50"})
     api = f"{CARDCOLLECTORS_API}?{params}"
     req = urllib.request.Request(api, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=20) as resp:
+    with urllib.request.urlopen(req, timeout=30) as resp:
         data = json.load(resp)
     out: list[dict] = []
     for p in data or []:
         title = html_lib.unescape(p.get("name") or "")
-        if not matches_keywords(title, DELTA_KEYWORDS):
+        if not matches_keywords(title, CARDCOLLECTORS_SEARCH_KEYWORDS):
+            continue
+        if matches_keywords(title, CARDCOLLECTORS_SEARCH_SKIP):
             continue
         slug = _slug_from_url(p.get("permalink") or "")
         out.append(
@@ -463,19 +486,20 @@ def fetch_cardcollectors_search(query: str) -> list[dict]:
     return out
 
 
-def check_cardcollectors_delta() -> None:
-    """Notify when Delta Reign / Delta Herrschaft products appear or restock."""
+def check_cardcollectors_search() -> None:
+    """Notify when 30th / Delta products appear or restock on CardCollectors."""
     by_id: dict[str, dict] = {}
     for query in CARDCOLLECTORS_SEARCH_QUERIES:
         try:
             for p in fetch_cardcollectors_search(query):
                 by_id[p["id"]] = p
         except Exception as exc:  # noqa: BLE001
-            print(f"[CardCollectors] Delta-Suche '{query}' FEHLER: {exc}")
+            print(f"[CardCollectors] Suche '{query}' FEHLER: {exc}")
 
-    print(f"[CardCollectors] Delta-Treffer: {len(by_id)}")
+    print(f"[CardCollectors] Search-Treffer (30th/Delta): {len(by_id)}")
     for p in by_id.values():
-        print(f"  · {p['title']}")
+        stock = "In den Warenkorb" if p.get("in_stock") else "Nicht vorrätig"
+        print(f"  · {stock}: {p['title']}")
 
     raw: dict = {"product_ids": [], "availability": {}, "initialized": False}
     if CARDCOLLECTORS_SEARCH_SEEN.exists():
@@ -486,7 +510,6 @@ def check_cardcollectors_delta() -> None:
             if isinstance(loaded, dict) and "product_ids" in loaded:
                 raw = loaded
             else:
-                # Very old shapes — fall back to load_seen helper.
                 raw = {
                     "product_ids": list(load_seen(CARDCOLLECTORS_SEARCH_SEEN)),
                     "availability": {},
@@ -523,7 +546,7 @@ def check_cardcollectors_delta() -> None:
             + "\n",
             encoding="utf-8",
         )
-        print("[CardCollectors] Delta: Erster Lauf, keine Mail.")
+        print("[CardCollectors] Search: Erster Lauf, keine Mail.")
         return
 
     new_products = [by_id[i] for i in current_ids if i not in seen]
@@ -542,13 +565,11 @@ def check_cardcollectors_delta() -> None:
     if alerts:
         if len(alerts) == 1:
             kind, p = alerts[0]
-            subject = f"🛒 CardCollectors DELTA [{kind}]: {p['title']}"
+            subject = f"🛒 CardCollectors [{kind}]: {p['title']}"
         else:
-            subject = (
-                f"🛒 CardCollectors: {len(alerts)} Delta-Reign-Updates"
-            )
+            subject = f"🛒 CardCollectors: {len(alerts)} 30th/Delta-Updates"
         lines = [
-            "Delta Reign / Delta Herrschaft Updates bei CardCollectors:",
+            "Updates bei CardCollectors (30th Celebration / Delta):",
             "",
         ]
         for kind, p in alerts:
@@ -558,7 +579,7 @@ def check_cardcollectors_delta() -> None:
             lines.append("")
         send_email(subject, "\n".join(lines))
     else:
-        print("[CardCollectors] Keine neuen / wieder verfügbaren Delta-Produkte.")
+        print("[CardCollectors] Keine neuen / wieder verfügbaren Search-Treffer.")
 
     merged_avail = dict(prev_avail)
     merged_avail.update(current_avail)
@@ -575,6 +596,34 @@ def check_cardcollectors_delta() -> None:
         + "\n",
         encoding="utf-8",
     )
+
+    # Keep watchlist in sync with newly discovered product URLs.
+    if CARDCOLLECTORS_WATCHLIST.exists():
+        try:
+            watch = json.loads(CARDCOLLECTORS_WATCHLIST.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            watch = []
+    else:
+        watch = []
+    watch_set = {str(u).rstrip("/") for u in watch}
+    added = 0
+    for p in by_id.values():
+        url = (p.get("url") or "").rstrip("/")
+        if url and url not in watch_set:
+            watch.append(url + "/")
+            watch_set.add(url)
+            added += 1
+    if added:
+        CARDCOLLECTORS_WATCHLIST.write_text(
+            json.dumps(watch, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        print(f"[CardCollectors] Watchlist +{added} URLs ergänzt.")
+
+
+def check_cardcollectors_delta() -> None:
+    # Back-compat alias used by main().
+    check_cardcollectors_search()
 
 
 # ----- Manor -----

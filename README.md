@@ -8,7 +8,7 @@ History wird nicht mehr geleert, wenn eine Liste kurz leer ist.
 | Shop | Was | Status |
 |------|-----|--------|
 | **Cardmaniac** | Pre-Order neu + Restock (30th/Delta = Priorität) | aktiv |
-| **CardCollectors** | Watchlist Restock + Delta-Suche neu/Restock | aktiv |
+| **CardCollectors** | Suche 30th/Delta **neu + Restock** + Watchlist Stock | aktiv |
 | **Manor** | 30th / Delta neu + Restock (`IN_STOCK`) | aktiv |
 | **Ryu.land** | 30th / Delta / Pre-Order neu + Varianten-Restock | aktiv |
 | **Pokecard** | Vorbestellungen neu + Restock | aktiv |
