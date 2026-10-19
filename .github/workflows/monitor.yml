@@ -10,7 +10,8 @@ on:
 
 concurrency:
   group: stock-monitor
-  cancel-in-progress: true
+  # Must NOT cancel: HP Studio queue/session refresh can take >60s.
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -28,6 +29,12 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          playwright install --with-deps chrome
+
       - name: Run monitor
         env:
           MAIL_TO: ${{ secrets.MAIL_TO }}
@@ -36,13 +43,17 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           FORCE_BRACK_SCAN: "0"
+          HP_STUDIO_ENABLED: "1"
+          HP_STUDIO_TARGET_DATE: "2026-10-21"
+          HP_STUDIO_TICKET_COUNT: "1"
+          HP_STUDIO_SESSION_WAIT_SEC: "180"
         run: python monitor.py
 
       - name: Commit updated state files
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add seen.json seen_brack.json brack_sitemap_state.json stock_cardcollectors.json seen_cardcollectors_search.json watchlist_cardcollectors.json seen_manor.json seen_ryu.json seen_pokecard.json seen_manashop.json seen_sparkleaf.json
+          git add seen.json seen_brack.json brack_sitemap_state.json stock_cardcollectors.json seen_cardcollectors_search.json watchlist_cardcollectors.json seen_manor.json seen_ryu.json seen_pokecard.json seen_manashop.json seen_sparkleaf.json seen_hp_studio.json
           if git diff --staged --quiet; then
             echo "Keine Änderung an State-Dateien"
           else

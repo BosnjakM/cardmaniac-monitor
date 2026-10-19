@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Monitor Cardmaniac, CardCollectors, Manor, Ryu, Pokecard, ManaShop, SparkLeaf, and Brack."""
+"""Monitor Cardmaniac, CardCollectors, Manor, Ryu, Pokecard, ManaShop, SparkLeaf, Brack, and HP Studio Tour."""
 
 from __future__ import annotations
 
@@ -11,9 +11,12 @@ import re
 import smtplib
 import ssl
 import subprocess
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
 
@@ -154,6 +157,25 @@ BRACK_URL_KEYWORDS = [
     "delta-herrschaft",
     "deltaherrschaft",
 ]
+
+# --- Harry Potter Studio Tour (WB London) — watch timeslots for a fixed date ---
+HP_STUDIO_SEEN = ROOT / "seen_hp_studio.json"
+HP_STUDIO_BOOK_URL = (
+    "https://book.wbstudiotour.com/?event_type_id=2&site_id=1&language_id=1"
+)
+HP_STUDIO_API = "https://book.wbstudiotour.com/api"
+HP_STUDIO_SITE_ID = 1
+HP_STUDIO_EVENT_TYPE_ID = 2
+# Wednesday 21 October 2026 (user request)
+HP_STUDIO_TARGET_DATE = (os.environ.get("HP_STUDIO_TARGET_DATE") or "2026-10-21").strip()
+HP_STUDIO_TICKET_COUNT = int(os.environ.get("HP_STUDIO_TICKET_COUNT") or "1")
+HP_STUDIO_ENABLED = (os.environ.get("HP_STUDIO_ENABLED") or "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+HP_STUDIO_SESSION_WAIT_SEC = int(os.environ.get("HP_STUDIO_SESSION_WAIT_SEC") or "180")
 
 # Highlight these on Cardmaniac (still notifies on all new products there)
 CARDMANIAC_PRIORITY_KEYWORDS = [
@@ -1811,7 +1833,329 @@ def check_brack() -> None:
     _save_brack_state({"fingerprint": fingerprint})
 
 
+# ----- Harry Potter Studio Tour (WB London) -----
+
+
+def _hp_studio_load_state() -> dict:
+    if not HP_STUDIO_SEEN.exists():
+        return {
+            "session": None,
+            "open_slot_ids": [],
+            "initialized": False,
+            "target_date": HP_STUDIO_TARGET_DATE,
+        }
+    try:
+        raw = json.loads(HP_STUDIO_SEEN.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        raw = {}
+    return {
+        "session": raw.get("session"),
+        "open_slot_ids": [str(x) for x in raw.get("open_slot_ids", [])],
+        "initialized": bool(raw.get("initialized")),
+        "target_date": raw.get("target_date") or HP_STUDIO_TARGET_DATE,
+    }
+
+
+def _hp_studio_save_state(
+    session: dict | None,
+    open_slot_ids: set[str] | list[str],
+    *,
+    initialized: bool = True,
+) -> None:
+    HP_STUDIO_SEEN.write_text(
+        json.dumps(
+            {
+                "session": session,
+                "open_slot_ids": sorted(str(x) for x in open_slot_ids),
+                "initialized": initialized,
+                "target_date": HP_STUDIO_TARGET_DATE,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _hp_studio_http_json(path: str, payload: dict, timeout: int = 45) -> dict:
+    url = f"{HP_STUDIO_API}{path}"
+    body = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "User-Agent": UA,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Origin": "https://book.wbstudiotour.com",
+            "Referer": "https://book.wbstudiotour.com/visit?language_id=1",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode(errors="ignore")
+        try:
+            return json.loads(raw)
+        except Exception:  # noqa: BLE001
+            raise RuntimeError(f"HTTP {exc.code}: {raw[:300]}") from exc
+
+
+def _hp_studio_session_usable(session: dict | None) -> bool:
+    if not session:
+        return False
+    if session.get("state") != "Active":
+        return False
+    if not session.get("session_id") or not session.get("secret"):
+        return False
+    exp = session.get("expiration_time")
+    if exp:
+        # API returns "YYYY-MM-DD HH:MM:SS" in what appears to be UTC/server time.
+        try:
+            exp_dt = datetime.strptime(str(exp), "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=timezone.utc
+            )
+            # Refresh a bit early so we don't race expiry mid-request.
+            if exp_dt.timestamp() <= time.time() + 60:
+                return False
+        except Exception:  # noqa: BLE001
+            pass
+    return True
+
+
+def _hp_studio_acquire_session() -> dict:
+    """Open the official booking queue in Chrome and wait until session is Active."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise RuntimeError(
+            "playwright fehlt — `pip install playwright && playwright install chrome`"
+        ) from exc
+
+    print("[HP Studio] Hole Active-Session über Booking-Queue…")
+    with sync_playwright() as p:
+        launch_kwargs = {
+            "headless": True,
+            "args": ["--disable-blink-features=AutomationControlled"],
+        }
+        try:
+            browser = p.chromium.launch(channel="chrome", **launch_kwargs)
+        except Exception:
+            browser = p.chromium.launch(**launch_kwargs)
+
+        context = browser.new_context(
+            user_agent=UA,
+            viewport={"width": 1280, "height": 800},
+            locale="en-GB",
+        )
+        page = context.new_page()
+        page.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
+        try:
+            page.goto(
+                HP_STUDIO_BOOK_URL,
+                wait_until="commit",
+                timeout=90_000,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[HP Studio] goto Warnung: {exc}")
+
+        deadline = time.time() + HP_STUDIO_SESSION_WAIT_SEC
+        session: dict | None = None
+        while time.time() < deadline:
+            raw = page.evaluate("() => sessionStorage.getItem('wbst_user_session')")
+            if raw:
+                try:
+                    session = json.loads(raw)
+                except Exception:  # noqa: BLE001
+                    session = None
+                if session:
+                    state = session.get("state")
+                    queue = session.get("queue_count")
+                    print(
+                        f"[HP Studio] Session state={state}"
+                        + (f" queue={queue}" if queue is not None else "")
+                    )
+                    if state == "Active" and session.get("session_id"):
+                        browser.close()
+                        return session
+            time.sleep(3)
+
+        browser.close()
+
+    raise RuntimeError(
+        f"Keine Active-Session innerhalb {HP_STUDIO_SESSION_WAIT_SEC}s "
+        "(Queue/Arkose)."
+    )
+
+
+def _hp_studio_get_or_refresh_session(state: dict) -> dict:
+    session = state.get("session") if isinstance(state.get("session"), dict) else None
+    if _hp_studio_session_usable(session):
+        # Cheap liveness probe via timeslot API.
+        try:
+            probe = _hp_studio_http_json(
+                "/getEvents",
+                {
+                    "session_id": session["session_id"],
+                    "secret": session["secret"],
+                    "site_id": HP_STUDIO_SITE_ID,
+                    "ticket_count": HP_STUDIO_TICKET_COUNT,
+                    "event_id": HP_STUDIO_EVENT_TYPE_ID,
+                    "start_date": HP_STUDIO_TARGET_DATE,
+                    "end_date": HP_STUDIO_TARGET_DATE,
+                },
+            )
+            if probe.get("success"):
+                print("[HP Studio] Bestehende Session gültig.")
+                return session
+        except Exception as exc:  # noqa: BLE001
+            print(f"[HP Studio] Session tot ({exc}), erneuere…")
+    return _hp_studio_acquire_session()
+
+
+def fetch_hp_studio_slots(session: dict) -> list[dict]:
+    data = _hp_studio_http_json(
+        "/getEvents",
+        {
+            "session_id": session["session_id"],
+            "secret": session["secret"],
+            "site_id": HP_STUDIO_SITE_ID,
+            "ticket_count": HP_STUDIO_TICKET_COUNT,
+            "event_id": HP_STUDIO_EVENT_TYPE_ID,
+            "start_date": HP_STUDIO_TARGET_DATE,
+            "end_date": HP_STUDIO_TARGET_DATE,
+        },
+    )
+    if not data.get("success"):
+        raise RuntimeError(
+            f"getEvents fehlgeschlagen: {data.get('message') or data}"
+        )
+    out: list[dict] = []
+    for row in data.get("data") or []:
+        eid = str(row.get("event_id") or "")
+        available = int(row.get("available") or 0)
+        start = str(row.get("startTime") or "")
+        out.append(
+            {
+                "id": eid,
+                "start_time": start,
+                "end_time": str(row.get("endTime") or ""),
+                "start_datetime": str(row.get("StartDateTime") or ""),
+                "available": available,
+                "url": (
+                    "https://book.wbstudiotour.com/visit?language_id=1"
+                    f"&date={HP_STUDIO_TARGET_DATE}"
+                ),
+                "title": (
+                    f"HP Studio Tour {HP_STUDIO_TARGET_DATE} {start}"
+                    f" ({available} Tickets)"
+                ),
+            }
+        )
+    return out
+
+
+def check_hp_studio() -> None:
+    if not HP_STUDIO_ENABLED:
+        print("[HP Studio] Übersprungen (HP_STUDIO_ENABLED=0).")
+        return
+
+    # Auto-disable after the target day (UTC) to avoid useless queue spam.
+    try:
+        target = datetime.strptime(HP_STUDIO_TARGET_DATE, "%Y-%m-%d").date()
+        if datetime.now(timezone.utc).date() > target:
+            print(
+                f"[HP Studio] Ziel-Datum {HP_STUDIO_TARGET_DATE} vorbei — Skip."
+            )
+            return
+    except Exception:  # noqa: BLE001
+        pass
+
+    state = _hp_studio_load_state()
+    session = _hp_studio_get_or_refresh_session(state)
+    slots = fetch_hp_studio_slots(session)
+    open_slots = [s for s in slots if s["available"] > 0]
+    open_ids = {s["id"] for s in open_slots if s["id"]}
+
+    print(
+        f"[HP Studio] {HP_STUDIO_TARGET_DATE}: "
+        f"{len(slots)} Slots, {len(open_slots)} mit Tickets"
+    )
+    for s in open_slots[:12]:
+        print(f"  · {s['start_time']} — {s['available']} verfügbar")
+
+    prev_open = set(state.get("open_slot_ids") or [])
+    initialized = bool(state.get("initialized"))
+
+    if not initialized:
+        _hp_studio_save_state(session, open_ids, initialized=True)
+        if open_slots:
+            # Seed without mail if tickets already exist; still alert if user
+            # wants first sighting — for sold-out days this is empty → OK.
+            print(
+                "[HP Studio] Erster Lauf: State initialisiert "
+                f"({len(open_ids)} offene Slots), keine Mail."
+            )
+        else:
+            print(
+                "[HP Studio] Erster Lauf: ausverkauft/initialisiert, warte auf Drops."
+            )
+        return
+
+    # Track currently-open ids so a slot that sells out and returns alerts again.
+    alerts = [s for s in open_slots if s["id"] not in prev_open]
+
+    if alerts:
+        print("[HP Studio] Alert:")
+        for s in alerts:
+            print(f"  - {s['title']}")
+        subject = (
+            f"⚡ HP Studio Tour Tickets {HP_STUDIO_TARGET_DATE}: "
+            f"{alerts[0]['start_time']}"
+        )
+        if len(alerts) > 1:
+            subject += f" (+{len(alerts) - 1} weitere)"
+        lines = [
+            f"Neue Tickets für Warner Bros. Studio Tour London:",
+            f"Datum: {HP_STUDIO_TARGET_DATE}",
+            HP_STUDIO_BOOK_URL,
+            "",
+            "Verfügbare Zeiten:",
+        ]
+        for s in alerts:
+            lines.append(
+                f"- {s['start_time']}–{s['end_time']} "
+                f"({s['available']} Tickets) event_id={s['id']}"
+            )
+        lines.extend(
+            [
+                "",
+                "Jetzt buchen:",
+                HP_STUDIO_BOOK_URL,
+                "https://book.wbstudiotour.com/visit?language_id=1",
+            ]
+        )
+        send_email(subject, "\n".join(lines))
+    else:
+        print("[HP Studio] Keine neuen freien Zeiten.")
+
+    # Keep union of ever-seen open ids? No — track currently open so a slot
+    # that sells out and returns triggers again.
+    _hp_studio_save_state(session, open_ids, initialized=True)
+
+
 def main() -> None:
+    try:
+        check_hp_studio()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[HP Studio] FEHLER: {exc}")
+
     try:
         check_cardmaniac()
     except Exception as exc:  # noqa: BLE001

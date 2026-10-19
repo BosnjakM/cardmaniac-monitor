@@ -1,0 +1,18 @@
+{
+  "session": {
+    "event_type_id": 2,
+    "site_id": 1,
+    "journey_id": null,
+    "created": "2026-10-19 20:06:24",
+    "state": "Active",
+    "expiration_time": "2026-10-19 20:21:24",
+    "session_time_left": 899,
+    "ticket_count": null,
+    "session_id": "2252986870",
+    "secret": "6gmrkqssfh9ovukz"
+  },
+  "open_slot_ids": [],
+  "initialized": true,
+  "target_date": "2026-10-21",
+  "updated_at": "2026-10-19T20:06:33.393510+00:00"
+}
