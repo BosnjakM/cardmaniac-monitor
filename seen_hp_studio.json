@@ -11,10 +11,8 @@
     "session_id": "8408168230",
     "secret": "ae8kqkexmpcqla0l"
   },
-  "open_slot_ids": [
-    "28270"
-  ],
+  "open_slot_ids": [],
   "initialized": true,
   "target_date": "2026-10-21",
-  "updated_at": "2026-10-20T14:48:14.238240+00:00"
+  "updated_at": "2026-10-20T14:50:39.541204+00:00"
 }
