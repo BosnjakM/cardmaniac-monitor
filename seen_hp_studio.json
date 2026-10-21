@@ -3,18 +3,18 @@
     "event_type_id": 2,
     "site_id": 1,
     "journey_id": null,
-    "created": "2026-10-21 07:59:21",
+    "created": "2026-10-21 08:02:21",
     "state": "Active",
-    "expiration_time": "2026-10-21 08:14:22",
-    "session_time_left": 896,
+    "expiration_time": "2026-10-21 08:17:22",
+    "session_time_left": 895,
     "ticket_count": null,
-    "session_id": "4773419683",
-    "secret": "2gc2kwnbyoalkooo"
+    "session_id": "4816461354",
+    "secret": "twzhhbfvke6v1hx"
   },
   "open_slot_ids": [
     "28274"
   ],
   "initialized": true,
   "target_date": "2026-10-21",
-  "updated_at": "2026-10-21T07:59:29.226426+00:00"
+  "updated_at": "2026-10-21T08:02:30.586542+00:00"
 }
