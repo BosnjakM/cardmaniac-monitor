@@ -757,6 +757,8 @@ def check_manor() -> None:
     print(f"[Manor] {len(matching)} Pokémon-Produkte geladen, {in_stock_n} an Lager")
     if len(matching) < 50:
         raise RuntimeError(f"nur {len(matching)} Produkte — State unverändert")
+    matching = [p for p in matching if not p.get("marketplace")]
+    print(f"[Manor] davon von Manor selbst (ohne Marktplatz): {len(matching)}")
 
     raw: dict = {
         "product_ids": [],
@@ -811,12 +813,11 @@ def check_manor() -> None:
         alerts.append(("NEU", p))
     for p in restocked:
         alerts.append(("WIEDER VERFÜGBAR", p))
-    # Priority (30th/Delta) first, then in-stock, then Manor's own over marketplace.
+    # Priority (30th/Delta) first, then in-stock.
     alerts.sort(
         key=lambda a: (
             not matches_keywords(a[1]["title"], MANOR_KEYWORDS),
             not current_avail.get(a[1]["id"]),
-            bool(a[1].get("marketplace")),
         )
     )
 
@@ -840,8 +841,7 @@ def check_manor() -> None:
         for kind, p in alerts:
             stock = "an Lager" if current_avail.get(p["id"]) else "nicht an Lager"
             price = f"CHF {p['price']}" if p.get("price") else "CHF ?"
-            seller = "Marktplatz-Händler" if p.get("marketplace") else "Manor"
-            lines.append(f"[{kind}] {p['title']} — {price} — {stock} ({seller})")
+            lines.append(f"[{kind}] {p['title']} — {price} — {stock}")
             lines.append(p["url"])
             lines.append("")
         lines.append("Alle Pokémon-Produkte bei Manor:")
