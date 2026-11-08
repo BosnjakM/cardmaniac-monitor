@@ -168,6 +168,18 @@ BRACK_PRIORITY_KEYWORDS = [
     "tech-sticker",
 ]
 
+# --- Brack live (search listing, newest first, with stock) — catches short drops ---
+BRACK_LIVE_SEEN = ROOT / "seen_brack_live.json"
+BRACK_LIVE_URLS = [
+    "https://www.brack.ch/search?sortProducts=newdesc"
+    "&filter%5BfacetManufacturerName%5D%5B%5D=The+Pok%C3%A9mon+Company",
+    "https://www.brack.ch/search?query=pokemon&sortProducts=newdesc"
+    "&filter%5Bcategories%5D%5B%5D=%2Fsport-freizeit%2Fspielwaren"
+    "%2Fpuzzles-spiele%2Fspiele%2Fsammelkarten",
+]
+# Fewer products than this across all pages = probably blocked/broken page.
+BRACK_LIVE_MIN_PRODUCTS = 5
+
 # --- Harry Potter Studio Tour (WB London) — watch timeslots for a fixed date ---
 HP_STUDIO_SEEN = ROOT / "seen_hp_studio.json"
 HP_STUDIO_BOOK_URL = (
@@ -1865,6 +1877,204 @@ def check_brack() -> None:
     )
 
 
+# ----- Brack live (listing + stock) -----
+
+
+def _brack_live_load_state() -> dict:
+    if not BRACK_LIVE_SEEN.exists():
+        return {"initialized": False, "products": {}}
+    try:
+        raw = json.loads(BRACK_LIVE_SEEN.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {"initialized": False, "products": {}}
+    return {
+        "initialized": bool(raw.get("initialized")),
+        "products": raw.get("products") or {},
+    }
+
+
+def _brack_live_save_state(products: dict) -> None:
+    BRACK_LIVE_SEEN.write_text(
+        json.dumps(
+            {
+                "initialized": True,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "products": dict(sorted(products.items())),
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _brack_live_parse(page_html: str) -> list[dict]:
+    m = re.search(
+        r'<script type="application/json" id="b2c-search-products">(.*?)</script>',
+        page_html,
+        re.S,
+    )
+    if not m:
+        return []
+    data = json.loads(m.group(1))
+    out: list[dict] = []
+    for sku, p in (data.get("productDataMap") or {}).items():
+        inv = p.get("inventory") or {}
+        stock = int(inv.get("current") or 0)
+        incoming = sum(
+            int(x.get("quantity") or 0) for x in inv.get("stockInOrder") or []
+        )
+        price_rp = (p.get("price") or {}).get("priceWithVat")
+        states = p.get("states") or {}
+        desc = p.get("description") or {}
+        name = desc.get("nameWithoutManufacturer") or _slug_title(p.get("url") or "")
+        out.append(
+            {
+                "sku": str(p.get("sku") or sku),
+                "title": html_lib.unescape(name.strip()),
+                "url": "https://www.brack.ch" + (p.get("url") or f"/p/{sku}"),
+                "price": (price_rp / 100) if isinstance(price_rp, (int, float)) else None,
+                "stock": stock,
+                "incoming": incoming,
+                "in_stock": stock > 0,
+                "pre_release": bool(states.get("preReleaseProduct")),
+            }
+        )
+    return out
+
+
+def fetch_brack_live() -> tuple[list[dict], bool]:
+    """Return (products, complete). complete=False if any listing page failed."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise RuntimeError(
+            "playwright fehlt — `pip install playwright && playwright install chrome`"
+        ) from exc
+
+    by_sku: dict[str, dict] = {}
+    complete = True
+    with sync_playwright() as p:
+        launch_kwargs = {
+            "headless": True,
+            "args": ["--disable-blink-features=AutomationControlled"],
+        }
+        try:
+            browser = p.chromium.launch(channel="chrome", **launch_kwargs)
+        except Exception:
+            browser = p.chromium.launch(**launch_kwargs)
+        context = browser.new_context(user_agent=UA, locale="de-CH")
+        context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
+        page = context.new_page()
+        for url in BRACK_LIVE_URLS:
+            try:
+                resp = page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+                status = resp.status if resp else 0
+                items = _brack_live_parse(page.content())
+                print(f"[Brack live] HTTP {status}, {len(items)} Produkte ← {url[:70]}…")
+                if status != 200 or not items:
+                    complete = False
+                for it in items:
+                    by_sku.setdefault(it["sku"], it)
+            except Exception as exc:  # noqa: BLE001
+                complete = False
+                print(f"[Brack live] Seite fehlgeschlagen: {exc}")
+        browser.close()
+    return list(by_sku.values()), complete
+
+
+def _brack_live_line(it: dict) -> str:
+    price = f"CHF {it['price']:.2f}" if it.get("price") is not None else "CHF ?"
+    if it["in_stock"]:
+        stock = f"{it['stock']} an Lager"
+    elif it.get("incoming"):
+        stock = f"0 an Lager, {it['incoming']} im Zulauf"
+    else:
+        stock = "nicht an Lager"
+    tag = " [Vorbestellung]" if it.get("pre_release") else ""
+    return f"{it['title']} — {price} — {stock}{tag}"
+
+
+def check_brack_live() -> None:
+    items, complete = fetch_brack_live()
+    if len(items) < BRACK_LIVE_MIN_PRODUCTS:
+        raise RuntimeError(
+            f"nur {len(items)} Produkte geladen — vermutlich blockiert, State unverändert"
+        )
+
+    state = _brack_live_load_state()
+    prev: dict = state["products"]
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    new_items: list[dict] = []
+    restocked: list[dict] = []
+    current_skus = set()
+    for it in items:
+        sku = it["sku"]
+        current_skus.add(sku)
+        old = prev.get(sku)
+        if old is None:
+            new_items.append(it)
+        elif it["in_stock"] and not (old.get("in_stock") and old.get("listed", True)):
+            restocked.append(it)
+
+    products = dict(prev)
+    for it in items:
+        products[it["sku"]] = {
+            "title": it["title"],
+            "url": it["url"],
+            "price": it["price"],
+            "stock": it["stock"],
+            "in_stock": it["in_stock"],
+            "listed": True,
+            "last_seen": now_iso,
+            "first_seen": (prev.get(it["sku"]) or {}).get("first_seen") or now_iso,
+        }
+    # Only trust "disappeared" when every listing page loaded fine.
+    if complete:
+        for sku, rec in products.items():
+            if sku not in current_skus and rec.get("listed", True):
+                rec["listed"] = False
+                rec["in_stock"] = False
+
+    in_stock_n = sum(1 for it in items if it["in_stock"])
+    print(f"[Brack live] {len(items)} Pokémon-Produkte, {in_stock_n} an Lager")
+
+    if not state["initialized"]:
+        _brack_live_save_state(products)
+        print(f"[Brack live] Erster Lauf: {len(items)} Produkte gespeichert, keine Mail.")
+        return
+
+    alerts = [("NEU", it) for it in new_items] + [("WIEDER DA", it) for it in restocked]
+    # In-stock first: that's what's actually buyable right now.
+    alerts.sort(key=lambda a: (not a[1]["in_stock"], a[0] != "NEU"))
+    if alerts:
+        top_kind, top = alerts[0]
+        price = f"CHF {top['price']:.2f}" if top.get("price") is not None else ""
+        stock = f"{top['stock']} an Lager" if top["in_stock"] else "nicht an Lager"
+        subject = f"🛒 Brack DROP: {top['title']} – {price} ({stock})"
+        if len(alerts) > 1:
+            subject += f" +{len(alerts) - 1} weitere"
+        lines = ["Brack.ch — Pokémon-Drop erkannt:", ""]
+        for kind, it in alerts:
+            lines.append(f"[{kind}] {_brack_live_line(it)}")
+            lines.append(it["url"])
+            lines.append("")
+        lines.append("Alle Pokémon-Produkte bei Brack (neueste zuerst):")
+        lines.append(BRACK_LIVE_URLS[0])
+        print("[Brack live] Alert:")
+        for kind, it in alerts:
+            print(f"  - [{kind}] {_brack_live_line(it)}")
+        send_email(subject, "\n".join(lines))
+    else:
+        print("[Brack live] Keine neuen Drops.")
+
+    _brack_live_save_state(products)
+
+
 # ----- Harry Potter Studio Tour (WB London) -----
 
 
@@ -2187,6 +2397,11 @@ def main() -> None:
         check_hp_studio()
     except Exception as exc:  # noqa: BLE001
         print(f"[HP Studio] FEHLER: {exc}")
+
+    try:
+        check_brack_live()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[Brack live] FEHLER: {exc}")
 
     try:
         check_cardmaniac()
