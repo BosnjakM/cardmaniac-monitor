@@ -2443,11 +2443,12 @@ def main() -> None:
     except Exception as exc:  # noqa: BLE001
         print(f"[SparkLeaf] FEHLER: {exc}")
 
-    # Brack: public product sitemaps (may occasionally fail from cloud IPs).
-    try:
-        check_brack()
-    except Exception as exc:  # noqa: BLE001
-        print(f"[Brack] FEHLER: {exc}")
+    # Brack sitemaps time out from GitHub runners; check_brack_live covers Brack.
+    if FORCE_BRACK_SCAN:
+        try:
+            check_brack()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[Brack] FEHLER: {exc}")
 
 
 if __name__ == "__main__":
