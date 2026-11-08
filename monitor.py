@@ -67,6 +67,7 @@ CARDCOLLECTORS_SEARCH_SKIP = [
 # --- Manor (Pokemon search → 30th / 30 Jahre / Delta Reign) ---
 MANOR_SEEN = ROOT / "seen_manor.json"
 MANOR_SEARCH = "https://www.manor.ch/de/search"
+MANOR_BRAND_PAGE = "https://www.manor.ch/de/shop/b/pokemon/web"
 MANOR_KEYWORDS = [
     "30th",
     "30 jahre",
@@ -674,8 +675,9 @@ def check_cardcollectors_delta() -> None:
 
 
 def _manor_fetch_page(page: int) -> tuple[int, list[dict]]:
-    params = {"query": "Pokemon", "brand": "pokemon", "page": str(page)}
-    url = MANOR_SEARCH + "?" + urllib.parse.urlencode(params)
+    # /search?page= is ignored by Manor; the brand page paginates 1-based.
+    params = {"sort": "NEW", "page": str(page + 1)}
+    url = MANOR_BRAND_PAGE + "?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(
         url,
         headers={
@@ -703,10 +705,13 @@ def _manor_fetch_page(page: int) -> tuple[int, list[dict]]:
         if not str(key).startswith("IndexedProduct:") or not isinstance(val, dict):
             continue
         title = val.get("name") or ""
+        code = str(val.get("code") or str(key).split("/")[-1])
         items.append(
             {
-                "id": str(val.get("code") or str(key).split("/")[-1]),
+                "id": code,
                 "title": title,
+                "price": (val.get("priceValue") or {}).get("formattedValue"),
+                "marketplace": code.startswith("mp-"),
                 "url": val.get("link")
                 or f"https://www.manor.ch/p/{str(key).split('/')[-1]}",
                 "brand": val.get("brandName") or val.get("brandId") or "",
@@ -716,7 +721,7 @@ def _manor_fetch_page(page: int) -> tuple[int, list[dict]]:
     return total, items
 
 
-def fetch_manor_keyword_products() -> list[dict]:
+def fetch_manor_products() -> list[dict]:
     total, first = _manor_fetch_page(0)
     page_size = max(len(first), 1)
     pages = max(1, (total + page_size - 1) // page_size)
@@ -739,19 +744,19 @@ def fetch_manor_keyword_products() -> list[dict]:
                 except Exception as exc:  # noqa: BLE001
                     print(f"[Manor] Seite {page} fehlgeschlagen: {exc}")
 
-    matching = [
-        p
-        for p in by_id.values()
-        if matches_keywords(p["title"], MANOR_KEYWORDS)
-    ]
-    return matching
+    return list(by_id.values())
+
+
+def _manor_in_stock(p: dict) -> bool:
+    return str(p.get("stock") or "").upper() in {"IN_STOCK", "LOW_STOCK"}
 
 
 def check_manor() -> None:
-    matching = fetch_manor_keyword_products()
-    print(f"[Manor] Keyword-Treffer (30th / Delta): {len(matching)}")
-    for p in matching:
-        print(f"  · {p['title']} [{p.get('stock')}]")
+    matching = fetch_manor_products()
+    in_stock_n = sum(1 for p in matching if _manor_in_stock(p))
+    print(f"[Manor] {len(matching)} Pokémon-Produkte geladen, {in_stock_n} an Lager")
+    if len(matching) < 50:
+        raise RuntimeError(f"nur {len(matching)} Produkte — State unverändert")
 
     raw: dict = {
         "product_ids": [],
@@ -765,10 +770,11 @@ def check_manor() -> None:
     prev_avail = {
         str(k): bool(v) for k, v in (raw.get("availability") or {}).items()
     }
-    initialized = bool(raw.get("initialized")) or bool(seen) or bool(prev_avail)
+    # Old state only tracked 30th/Delta keyword hits → re-seed for all products.
+    initialized = bool(raw.get("initialized")) and raw.get("scope") == "all"
     match_ids = {p["id"] for p in matching}
     current_avail = {
-        p["id"]: str(p.get("stock") or "").upper() == "IN_STOCK" for p in matching
+        p["id"]: _manor_in_stock(p) for p in matching
     }
 
     if not initialized:
@@ -780,6 +786,7 @@ def check_manor() -> None:
                         k: current_avail[k] for k in sorted(current_avail)
                     },
                     "initialized": True,
+                    "scope": "all",
                 },
                 indent=2,
                 ensure_ascii=False,
@@ -804,33 +811,44 @@ def check_manor() -> None:
         alerts.append(("NEU", p))
     for p in restocked:
         alerts.append(("WIEDER VERFÜGBAR", p))
+    # Priority (30th/Delta) first, then in-stock, then Manor's own over marketplace.
+    alerts.sort(
+        key=lambda a: (
+            not matches_keywords(a[1]["title"], MANOR_KEYWORDS),
+            not current_avail.get(a[1]["id"]),
+            bool(a[1].get("marketplace")),
+        )
+    )
 
     if alerts:
         print("[Manor] Alert:")
         for kind, p in alerts:
             print(f"  - [{kind}] {p['title']} [{p.get('stock')}]")
 
-        if len(alerts) == 1:
-            kind, p = alerts[0]
-            subject = f"🏬 Manor [{kind}]: {p['title']}"
-        else:
-            subject = f"🏬 Manor: {len(alerts)} 30th/Delta-Updates"
+        kind, top = alerts[0]
+        prio = matches_keywords(top["title"], MANOR_KEYWORDS)
+        price = f" – CHF {top['price']}" if top.get("price") else ""
+        stock = "an Lager" if current_avail.get(top["id"]) else "nicht an Lager"
+        subject = (
+            f"🏬 Manor {'PRIORITÄT ' if prio else ''}[{kind}]: "
+            f"{top['title']}{price} ({stock})"
+        )
+        if len(alerts) > 1:
+            subject += f" +{len(alerts) - 1} weitere"
 
-        lines = [
-            "Updates bei Manor (30th / Delta Reign / Delta Herrschaft):",
-            "https://www.manor.ch/de/search?query=Pokemon",
-            "",
-        ]
+        lines = ["Neue / wieder verfügbare Pokémon-Produkte bei Manor:", ""]
         for kind, p in alerts:
-            stock = p.get("stock") or (
-                "IN_STOCK" if current_avail.get(p["id"]) else "OUT_OF_STOCK"
-            )
-            lines.append(f"- [{kind}] {p['title']} ({stock})")
-            lines.append(f"  {p['url']}")
+            stock = "an Lager" if current_avail.get(p["id"]) else "nicht an Lager"
+            price = f"CHF {p['price']}" if p.get("price") else "CHF ?"
+            seller = "Marktplatz-Händler" if p.get("marketplace") else "Manor"
+            lines.append(f"[{kind}] {p['title']} — {price} — {stock} ({seller})")
+            lines.append(p["url"])
             lines.append("")
+        lines.append("Alle Pokémon-Produkte bei Manor:")
+        lines.append(MANOR_BRAND_PAGE + "?sort=NEW")
         send_email(subject, "\n".join(lines))
     else:
-        print("[Manor] Keine neuen / wieder verfügbaren Keyword-Treffer.")
+        print("[Manor] Keine neuen / wieder verfügbaren Pokémon-Produkte.")
 
     merged_avail = dict(prev_avail)
     merged_avail.update(current_avail)
@@ -840,6 +858,7 @@ def check_manor() -> None:
                 "product_ids": sorted(seen | match_ids),
                 "availability": {k: merged_avail[k] for k in sorted(merged_avail)},
                 "initialized": True,
+                "scope": "all",
             },
             indent=2,
             ensure_ascii=False,
