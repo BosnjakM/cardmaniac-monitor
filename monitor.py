@@ -23,9 +23,20 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 
 # --- Cardmaniac (notify on ANY new pre-order product) ---
-CARDMANIAC_URL = "https://cardmaniac.ch/collections/pre-order/products.json"
-CARDMANIAC_PAGE = "https://cardmaniac.ch/collections/pre-order"
-CARDMANIAC_SEEN = ROOT / "seen.json"
+CARDMANIAC_COLLECTIONS = [
+    {
+        "label": "Pre-Order",
+        "json": "https://cardmaniac.ch/collections/pre-order/products.json?limit=250",
+        "page": "https://cardmaniac.ch/collections/pre-order",
+        "seen": ROOT / "seen.json",
+    },
+    {
+        "label": "Neuheiten",
+        "json": "https://cardmaniac.ch/collections/neuheiten/products.json?limit=250",
+        "page": "https://cardmaniac.ch/collections/neuheiten",
+        "seen": ROOT / "seen_cardmaniac_neuheiten.json",
+    },
+]
 
 # --- CardCollectors (watchlist stock + search for 30th / Delta listings) ---
 CARDCOLLECTORS_WATCHLIST = ROOT / "watchlist_cardcollectors.json"
@@ -276,9 +287,9 @@ def send_email(subject: str, body: str) -> None:
 # ----- Cardmaniac -----
 
 
-def fetch_cardmaniac() -> list[dict]:
+def fetch_cardmaniac(collection: dict) -> list[dict]:
     req = urllib.request.Request(
-        CARDMANIAC_URL,
+        collection["json"],
         headers={"User-Agent": "cardmaniac-monitor/1.1"},
     )
     with urllib.request.urlopen(req, timeout=30) as resp:
@@ -287,7 +298,8 @@ def fetch_cardmaniac() -> list[dict]:
     products = []
     for p in data.get("products", []):
         handle = p.get("handle", "")
-        available = any(bool(v.get("available")) for v in p.get("variants", []))
+        variants = p.get("variants", [])
+        available = any(bool(v.get("available")) for v in variants)
         products.append(
             {
                 "id": str(p["id"]),
@@ -295,8 +307,9 @@ def fetch_cardmaniac() -> list[dict]:
                 "url": (
                     f"https://cardmaniac.ch/products/{handle}"
                     if handle
-                    else CARDMANIAC_PAGE
+                    else collection["page"]
                 ),
+                "price": variants[0].get("price") if variants else None,
                 "available": available,
                 "shop": "Cardmaniac",
             }
@@ -304,10 +317,10 @@ def fetch_cardmaniac() -> list[dict]:
     return products
 
 
-def _cardmaniac_load_state() -> dict:
-    if not CARDMANIAC_SEEN.exists():
+def _cardmaniac_load_state(path: Path) -> dict:
+    if not path.exists():
         return {"product_ids": [], "availability": {}, "initialized": False}
-    raw = json.loads(CARDMANIAC_SEEN.read_text(encoding="utf-8"))
+    raw = json.loads(path.read_text(encoding="utf-8"))
     return {
         "product_ids": [str(x) for x in raw.get("product_ids", [])],
         "availability": {
@@ -318,9 +331,9 @@ def _cardmaniac_load_state() -> dict:
 
 
 def _cardmaniac_save_state(
-    product_ids: set[str], availability: dict[str, bool]
+    path: Path, product_ids: set[str], availability: dict[str, bool]
 ) -> None:
-    CARDMANIAC_SEEN.write_text(
+    path.write_text(
         json.dumps(
             {
                 "product_ids": sorted(product_ids),
@@ -335,11 +348,13 @@ def _cardmaniac_save_state(
     )
 
 
-def check_cardmaniac() -> None:
-    products = fetch_cardmaniac()
-    print(f"[Cardmaniac] Gefunden: {len(products)} Produkte")
+def check_cardmaniac_collection(collection: dict) -> None:
+    label = collection["label"]
+    tag = f"[Cardmaniac {label}]"
+    products = fetch_cardmaniac(collection)
+    print(f"{tag} Gefunden: {len(products)} Produkte")
 
-    state = _cardmaniac_load_state()
+    state = _cardmaniac_load_state(collection["seen"])
     seen = set(state["product_ids"])
     prev_avail = state["availability"]
     current_ids = {p["id"] for p in products}
@@ -349,8 +364,8 @@ def check_cardmaniac() -> None:
     # NEVER treat an empty list after a wipe as "first run" — that missed the
     # 30 Jahre drop on 2026-09-03 when pre-order was briefly empty.
     if not state["initialized"]:
-        _cardmaniac_save_state(current_ids, current_avail)
-        print("[Cardmaniac] Erster Lauf: seen.json initialisiert, keine Mail.")
+        _cardmaniac_save_state(collection["seen"], current_ids, current_avail)
+        print(f"{tag} Erster Lauf: State initialisiert, keine Mail.")
         return
 
     new_products = [p for p in products if p["id"] not in seen]
@@ -369,7 +384,7 @@ def check_cardmaniac() -> None:
         alerts.append(("WIEDER VERFÜGBAR", p))
 
     if alerts:
-        print("[Cardmaniac] Alert:")
+        print(f"{tag} Alert:")
         for kind, p in alerts:
             print(f"  - [{kind}] {p['title']}")
 
@@ -379,18 +394,18 @@ def check_cardmaniac() -> None:
             if matches_keywords(p["title"], CARDMANIAC_PRIORITY_KEYWORDS)
         ]
         if priority:
-            subject = f"🎯 Cardmaniac PRIORITÄT: {priority[0]['title']}"
+            subject = f"🎯 Cardmaniac {label} PRIORITÄT: {priority[0]['title']}"
             if len(alerts) > 1:
                 subject += f" (+{len(alerts) - 1} weitere)"
         elif len(alerts) == 1:
             kind, p = alerts[0]
-            subject = f"🆕 Cardmaniac [{kind}]: {p['title']}"
+            subject = f"🆕 Cardmaniac {label} [{kind}]: {p['title']}"
         else:
-            subject = f"🆕 Cardmaniac: {len(alerts)} Pre-Order-Updates"
+            subject = f"🆕 Cardmaniac {label}: {len(alerts)} Updates"
 
         lines = [
-            "Updates bei Cardmaniac Pre-Order:",
-            CARDMANIAC_PAGE,
+            f"Updates bei Cardmaniac {label}:",
+            collection["page"],
             "",
         ]
         for kind, p in alerts:
@@ -400,17 +415,26 @@ def check_cardmaniac() -> None:
                 else ""
             )
             stock = "verfügbar" if p["available"] else "ausverkauft/preorder"
-            lines.append(f"- [{kind}] {p['title']}{mark} ({stock})")
+            price = f"CHF {p['price']} — " if p.get("price") else ""
+            lines.append(f"- [{kind}] {p['title']}{mark} ({price}{stock})")
             lines.append(f"  {p['url']}")
             lines.append("")
         send_email(subject, "\n".join(lines))
     else:
-        print("[Cardmaniac] Keine neuen / wieder verfügbaren Produkte.")
+        print(f"{tag} Keine neuen / wieder verfügbaren Produkte.")
 
     # Keep history even if the collection goes empty (critical).
     merged_avail = dict(prev_avail)
     merged_avail.update(current_avail)
-    _cardmaniac_save_state(seen | current_ids, merged_avail)
+    _cardmaniac_save_state(collection["seen"], seen | current_ids, merged_avail)
+
+
+def check_cardmaniac() -> None:
+    for collection in CARDMANIAC_COLLECTIONS:
+        try:
+            check_cardmaniac_collection(collection)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[Cardmaniac {collection['label']}] FEHLER: {exc}")
 
 
 # ----- CardCollectors (stock watch) -----
