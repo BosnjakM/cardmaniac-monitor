@@ -138,15 +138,18 @@ SPARKLEAF_SEARCH_QUERIES = [
     "Delta Herrschaft",
 ]
 
-# --- Brack (notify only on keyword matches via public sitemaps) ---
+# --- Brack (any new Pokémon product via public Google product sitemaps) ---
 BRACK_SEEN = ROOT / "seen_brack.json"
 BRACK_STATE = ROOT / "brack_sitemap_state.json"
 BRACK_SITEMAP_INDEX = (
     "https://www.brack.ch/exports/google/brack.ch/de/sitemap-index.xml"
 )
-
-# Match against URL slug (lowercase). Keep specific to avoid false positives.
-BRACK_URL_KEYWORDS = [
+# Full re-scan at least this often even if sitemap index fingerprint is unchanged.
+BRACK_FULL_SCAN_MAX_AGE_SEC = int(
+    os.environ.get("BRACK_FULL_SCAN_MAX_AGE_SEC") or str(6 * 3600)
+)
+# Highlight these in the email subject (still notifies on ALL new Pokémon URLs).
+BRACK_PRIORITY_KEYWORDS = [
     "30th",
     "30-jahre",
     "30jahre",
@@ -156,6 +159,13 @@ BRACK_URL_KEYWORDS = [
     "deltareign",
     "delta-herrschaft",
     "deltaherrschaft",
+    "booster",
+    "elite-trainer",
+    "top-trainer",
+    "etb",
+    "display",
+    "ultra-premium",
+    "tech-sticker",
 ]
 
 # --- Harry Potter Studio Tour (WB London) — watch timeslots for a fixed date ---
@@ -1666,11 +1676,11 @@ def _save_brack_state(state: dict) -> None:
 
 
 def scan_brack_sitemaps(sitemap_urls: list[str]) -> list[dict]:
+    """Collect every Brack product URL that looks Pokémon-related."""
     pattern = re.compile(
         r"https://www\.brack\.ch/[^<\s\"]*(?:the-pokemon-company|pokemon)[^<\s\"]*",
         re.I,
     )
-    kw_re = re.compile("|".join(re.escape(k) for k in BRACK_URL_KEYWORDS), re.I)
 
     products: dict[str, dict] = {}
     ok = 0
@@ -1683,8 +1693,6 @@ def scan_brack_sitemaps(sitemap_urls: list[str]) -> list[dict]:
         ok += 1
         text = raw.decode("utf-8", errors="ignore")
         for url in pattern.findall(text):
-            if not kw_re.search(url):
-                continue
             sku = url.rstrip("/").rsplit("-", 1)[-1]
             pid = sku if sku.isdigit() else url
             products[pid] = {
@@ -1692,11 +1700,15 @@ def scan_brack_sitemaps(sitemap_urls: list[str]) -> list[dict]:
                 "title": _slug_title(url),
                 "url": url,
                 "shop": "Brack",
+                "priority": matches_keywords(url, BRACK_PRIORITY_KEYWORDS),
             }
 
     if ok == 0:
         raise RuntimeError("Keine Product-Sitemap konnte geladen werden")
-    print(f"[Brack] {ok}/{len(sitemap_urls)} Sitemaps gescannt, Treffer: {len(products)}")
+    print(
+        f"[Brack] {ok}/{len(sitemap_urls)} Sitemaps gescannt, "
+        f"Pokémon-Treffer: {len(products)}"
+    )
     return list(products.values())
 
 
@@ -1712,21 +1724,26 @@ def check_brack() -> None:
     if not sitemap_urls:
         sitemap_urls = [
             f"https://www.brack.ch/exports/google/brack.ch/de/google-product-sitemap-{i}.xml"
-            for i in range(1, 32)
+            for i in range(1, 36)
         ]
 
     state = _load_brack_state()
     prev = state.get("fingerprint")
-    if prev == fingerprint and not FORCE_BRACK_SCAN:
+    last_full = float(state.get("last_full_scan_ts") or 0)
+    stale = (time.time() - last_full) >= BRACK_FULL_SCAN_MAX_AGE_SEC
+    if prev == fingerprint and not FORCE_BRACK_SCAN and not stale:
         print("[Brack] Sitemap unverändert — kein Full-Scan nötig.")
         return
 
-    reason = "erzwungen" if FORCE_BRACK_SCAN else "Sitemap-Index geändert"
+    if FORCE_BRACK_SCAN:
+        reason = "erzwungen"
+    elif prev != fingerprint:
+        reason = "Sitemap-Index geändert"
+    else:
+        reason = f"periodisch (>{BRACK_FULL_SCAN_MAX_AGE_SEC // 3600}h)"
     print(f"[Brack] Full-Scan ({reason})…")
     matching = scan_brack_sitemaps(sitemap_urls)
-    print(f"[Brack] Keyword-Treffer: {len(matching)}")
-    for p in matching:
-        print(f"  · {p['title']}")
+    print(f"[Brack] Pokémon-Produkte in Sitemap: {len(matching)}")
 
     raw: dict = {"product_ids": [], "presence": {}, "initialized": False}
     if BRACK_SEEN.exists():
@@ -1753,18 +1770,19 @@ def check_brack() -> None:
     }
     initialized = bool(raw.get("initialized")) or bool(seen) or bool(prev_presence)
     match_ids = {p["id"] for p in matching}
-    # Presence: currently in sitemap keyword hits
     current_presence = {pid: True for pid in match_ids}
-    # Mark previously known IDs absent if missing this scan
     for pid in seen:
         current_presence.setdefault(pid, False)
 
+    now_ts = time.time()
     if not initialized:
         BRACK_SEEN.write_text(
             json.dumps(
                 {
                     "product_ids": sorted(match_ids),
-                    "presence": {k: current_presence[k] for k in sorted(current_presence)},
+                    "presence": {
+                        k: current_presence[k] for k in sorted(current_presence)
+                    },
                     "initialized": True,
                 },
                 indent=2,
@@ -1773,8 +1791,13 @@ def check_brack() -> None:
             + "\n",
             encoding="utf-8",
         )
-        _save_brack_state({"fingerprint": fingerprint})
-        print("[Brack] Erster Lauf: State gespeichert, keine Mail.")
+        _save_brack_state(
+            {"fingerprint": fingerprint, "last_full_scan_ts": now_ts}
+        )
+        print(
+            f"[Brack] Erster Lauf: {len(match_ids)} Pokémon-Produkte "
+            "geseedet, keine Mail."
+        )
         return
 
     by_id = {p["id"]: p for p in matching}
@@ -1794,26 +1817,33 @@ def check_brack() -> None:
     if alerts:
         print("[Brack] Alert:")
         for kind, p in alerts:
-            print(f"  - [{kind}] {p['title']}")
+            mark = " [PRIORITÄT]" if p.get("priority") else ""
+            print(f"  - [{kind}] {p['title']}{mark}")
 
-        if len(alerts) == 1:
+        priority = [p for _, p in alerts if p.get("priority")]
+        if priority:
+            subject = f"🎯 Brack PRIORITÄT: {priority[0]['title']}"
+            if len(alerts) > 1:
+                subject += f" (+{len(alerts) - 1} weitere)"
+        elif len(alerts) == 1:
             kind, p = alerts[0]
             subject = f"🛒 Brack [{kind}]: {p['title']}"
         else:
-            subject = f"🛒 Brack: {len(alerts)} 30th/Delta-Updates"
+            subject = f"🛒 Brack: {len(alerts)} neue Pokémon-Produkte"
 
         lines = [
-            "Updates bei Brack (30th / Delta Reign / Delta Herrschaft):",
-            "https://www.brack.ch/",
+            "Neue / wieder gelistete Pokémon-Produkte bei Brack:",
+            "https://www.brack.ch/sammelkarten",
             "",
         ]
         for kind, p in alerts:
-            lines.append(f"- [{kind}] {p['title']}")
+            mark = " [PRIORITÄT]" if p.get("priority") else ""
+            lines.append(f"- [{kind}] {p['title']}{mark}")
             lines.append(f"  {p['url']}")
             lines.append("")
         send_email(subject, "\n".join(lines))
     else:
-        print("[Brack] Keine neuen / wieder auftauchenden Keyword-Treffer.")
+        print("[Brack] Keine neuen Pokémon-Produkte in der Sitemap.")
 
     merged_presence = dict(prev_presence)
     merged_presence.update(current_presence)
@@ -1830,7 +1860,9 @@ def check_brack() -> None:
         + "\n",
         encoding="utf-8",
     )
-    _save_brack_state({"fingerprint": fingerprint})
+    _save_brack_state(
+        {"fingerprint": fingerprint, "last_full_scan_ts": now_ts}
+    )
 
 
 # ----- Harry Potter Studio Tour (WB London) -----
@@ -2196,14 +2228,11 @@ def main() -> None:
     except Exception as exc:  # noqa: BLE001
         print(f"[SparkLeaf] FEHLER: {exc}")
 
-    # Brack is often blocked from GitHub cloud — only run when forced.
-    if FORCE_BRACK_SCAN:
-        try:
-            check_brack()
-        except Exception as exc:  # noqa: BLE001
-            print(f"[Brack] FEHLER: {exc}")
-    else:
-        print("[Brack] Übersprungen (nur bei FORCE_BRACK_SCAN=1).")
+    # Brack: public product sitemaps (may occasionally fail from cloud IPs).
+    try:
+        check_brack()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[Brack] FEHLER: {exc}")
 
 
 if __name__ == "__main__":
