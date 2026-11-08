@@ -2394,11 +2394,6 @@ def check_hp_studio() -> None:
 
 def main() -> None:
     try:
-        check_hp_studio()
-    except Exception as exc:  # noqa: BLE001
-        print(f"[HP Studio] FEHLER: {exc}")
-
-    try:
         check_brack_live()
     except Exception as exc:  # noqa: BLE001
         print(f"[Brack live] FEHLER: {exc}")
@@ -2432,11 +2427,6 @@ def main() -> None:
         check_pokecard()
     except Exception as exc:  # noqa: BLE001
         print(f"[Pokecard] FEHLER: {exc}")
-
-    try:
-        check_manashop()
-    except Exception as exc:  # noqa: BLE001
-        print(f"[ManaShop] FEHLER: {exc}")
 
     try:
         check_sparkleaf()
