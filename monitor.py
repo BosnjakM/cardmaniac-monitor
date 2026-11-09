@@ -2457,11 +2457,6 @@ def main() -> None:
         print(f"[CardCollectors Delta] FEHLER: {exc}")
 
     try:
-        check_manor()
-    except Exception as exc:  # noqa: BLE001
-        print(f"[Manor] FEHLER: {exc}")
-
-    try:
         check_ryu()
     except Exception as exc:  # noqa: BLE001
         print(f"[Ryu] FEHLER: {exc}")
