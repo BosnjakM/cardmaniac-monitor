@@ -1,0 +1,29 @@
+name: Orell mail
+
+on:
+  repository_dispatch:
+    types: [orell-alert]
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Send mail
+        env:
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          SMTP_HOST: smtp.gmail.com
+          SMTP_PORT: "587"
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          ALERT_SUBJECT: ${{ toJSON(github.event.client_payload.subject) }}
+          ALERT_BODY: ${{ toJSON(github.event.client_payload.body) }}
+        run: python monitor.py --send

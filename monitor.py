@@ -11,6 +11,7 @@ import re
 import smtplib
 import ssl
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -303,6 +304,66 @@ def send_email(subject: str, body: str) -> None:
 
     # Don't print the address — Actions logs are public on public repos.
     print(f"Email gesendet: {subject}")
+
+
+def _git_credential_token() -> str:
+    try:
+        proc = subprocess.run(
+            ["git", "credential", "fill"],
+            input="protocol=https\nhost=github.com\n\n",
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+    except Exception:  # noqa: BLE001
+        return ""
+    for line in proc.stdout.splitlines():
+        if line.startswith("password="):
+            return line.split("=", 1)[1].strip()
+    return ""
+
+
+def dispatch_orell_alert(subject: str, body: str) -> None:
+    """Ask GitHub Actions to send the mail. Used when this machine has no SMTP secrets."""
+    token = (os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or "").strip()
+    if not token:
+        token = _git_credential_token()
+    if not token:
+        raise RuntimeError("kein GitHub-Token, Orell-Mail kann nicht ausgelöst werden")
+    payload = json.dumps(
+        {
+            "event_type": "orell-alert",
+            "client_payload": {"subject": subject[:180], "body": body[:8000]},
+        }
+    ).encode()
+    req = urllib.request.Request(
+        "https://api.github.com/repos/BosnjakM/cardmaniac-monitor/dispatches",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+            "User-Agent": "cardmaniac-monitor",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            status = resp.status
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:200]
+        raise RuntimeError(f"Orell-Mail Dispatch HTTP {exc.code}: {detail}") from exc
+    if status not in (200, 204):
+        raise RuntimeError(f"Orell-Mail Dispatch HTTP {status}")
+    print(f"Orell-Mail angestossen: {subject}")
+
+
+def deliver_alert(subject: str, body: str) -> None:
+    if MAIL_TO and SMTP_USER and SMTP_PASS:
+        send_email(subject, body)
+        return
+    dispatch_orell_alert(subject, body)
 
 
 # ----- Cardmaniac -----
@@ -2648,11 +2709,11 @@ def check_orell() -> None:
         print("[Orell] Alert:")
         for it in new_items:
             print(f"  - {it['title']}")
-        send_email(subject, "\n".join(lines))
-    else:
-        print("[Orell] Keine neuen Produkte.")
+        deliver_alert(subject, "\n".join(lines))
+        _orell_save_state(seen | current_ids)
+        return
 
-    _orell_save_state(seen | current_ids)
+    print("[Orell] Keine neuen Produkte.")
 
 
 def main() -> None:
@@ -2704,5 +2765,22 @@ def main() -> None:
             print(f"[Brack] FEHLER: {exc}")
 
 
+def _send_from_env() -> None:
+    subject = os.environ.get("ALERT_SUBJECT") or ""
+    body = os.environ.get("ALERT_BODY") or ""
+    if body[:1] == '"':
+        body = json.loads(body)
+    if subject[:1] == '"':
+        subject = json.loads(subject)
+    if not subject or not body:
+        raise SystemExit("ALERT_SUBJECT / ALERT_BODY fehlen")
+    send_email(subject, body)
+
+
 if __name__ == "__main__":
-    main()
+    if "--send" in sys.argv:
+        _send_from_env()
+    elif "--orell-only" in sys.argv:
+        check_orell()
+    else:
+        main()
