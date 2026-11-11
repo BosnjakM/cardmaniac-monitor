@@ -2560,8 +2560,24 @@ def fetch_orell() -> list[dict]:
         )
         page = context.new_page()
         page.goto(ORELL_SEARCH_URL, wait_until="domcontentloaded", timeout=60_000)
-        items = _orell_parse_search(page.content())
-        print(f"[Orell] Suche: {len(items)} Pokémon-Produkte")
+        try:
+            page.wait_for_selector("dl-product", timeout=20_000)
+        except Exception:
+            pass
+        html = page.content()
+        items = _orell_parse_search(html)
+        print(f"[Orell] Suche: {len(items)} Pokémon-Produkte ({html.count('<dl-product')} Treffer roh)")
+        if len(items) < ORELL_MIN_PRODUCTS:
+            title_match = re.search(r"<title>([^<]+)</title>", html)
+            title = html_lib.unescape(title_match.group(1)).strip() if title_match else "?"
+            print(f"[Orell] Seite: {title[:140]}")
+            print(f"[Orell] URL: {page.url}")
+            raw_names = [
+                html_lib.unescape(name)
+                for name in re.findall(r'<dl-product\b[^>]*\bname="([^"]*)"', html)[:5]
+            ]
+            if raw_names:
+                print("[Orell] erste Treffer: " + " | ".join(raw_names))
         by_id = {it["id"]: it for it in items}
         for ean, label in ORELL_WATCH_EANS:
             url = f"https://www.orellfuessli.ch/shop/home/artikeldetails/EAN{ean}"
