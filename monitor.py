@@ -204,6 +204,10 @@ ORELL_WATCH_EANS = [
     ("0196214146983", "30 Jahre Tin #1 Tag (DE)"),
 ]
 ORELL_MIN_PRODUCTS = 8
+# Listed, but the user does not want a mail for it.
+ORELL_IGNORE_IDS = {
+    "A1078304664",  # PKM Lillie and Clefairy Alcove Tower
+}
 ORELL_PRIORITY_KEYWORDS = [
     "30 jahre",
     "30th",
@@ -2675,7 +2679,7 @@ def check_orell() -> None:
         )
 
     state = _orell_load_state()
-    seen = set(state["product_ids"])
+    seen = set(state["product_ids"]) | set(ORELL_IGNORE_IDS)
     current_ids = {it["id"] for it in items}
     new_items = [it for it in items if it["id"] not in seen]
     new_items.sort(
@@ -2686,7 +2690,7 @@ def check_orell() -> None:
     )
 
     if not state["initialized"]:
-        _orell_save_state(current_ids)
+        _orell_save_state(current_ids | set(ORELL_IGNORE_IDS))
         print(f"[Orell] Erster Lauf: {len(current_ids)} Produkte gespeichert, keine Mail.")
         return
 
