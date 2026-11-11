@@ -2459,6 +2459,10 @@ def check_hp_studio() -> None:
 # ----- Orell Füssli / Thalia -----
 
 
+def _orell_blocked(page_html: str) -> bool:
+    return "Zugriff geblockt" in page_html or "Sicherheits-Check" in page_html
+
+
 def _orell_is_pokemon(title: str) -> bool:
     folded = html_lib.unescape(title).casefold()
     return "pokémon" in folded or "pokemon" in folded or "pkm" in folded
@@ -2559,12 +2563,15 @@ def fetch_orell() -> list[dict]:
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
         page = context.new_page()
+        page.goto("https://www.orellfuessli.ch/", wait_until="domcontentloaded", timeout=60_000)
         page.goto(ORELL_SEARCH_URL, wait_until="domcontentloaded", timeout=60_000)
-        try:
-            page.wait_for_selector("dl-product", timeout=20_000)
-        except Exception:
-            pass
         html = page.content()
+        if not _orell_blocked(html):
+            try:
+                page.wait_for_selector("dl-product", timeout=20_000)
+            except Exception:
+                pass
+            html = page.content()
         items = _orell_parse_search(html)
         print(f"[Orell] Suche: {len(items)} Pokémon-Produkte ({html.count('<dl-product')} Treffer roh)")
         if len(items) < ORELL_MIN_PRODUCTS:
@@ -2586,6 +2593,9 @@ def fetch_orell() -> list[dict]:
                 found = _orell_product_from_page(page.content(), page.url, label)
             except Exception as exc:  # noqa: BLE001
                 print(f"[Orell] EAN {ean} nicht prüfbar: {exc}")
+                continue
+            if _orell_blocked(page.content()):
+                print(f"[Orell] EAN {ean} blockiert, übersprungen")
                 continue
             if found is None:
                 print(f"[Orell] noch nicht gelistet: {label}")
