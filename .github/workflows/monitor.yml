@@ -33,7 +33,13 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          playwright install --with-deps chrome
+          # GitHub runners already have Chrome. apt --with-deps dies when
+          # azure.archive.ubuntu.com does not resolve, and then nothing runs.
+          if command -v google-chrome >/dev/null || command -v google-chrome-stable >/dev/null; then
+            (google-chrome --version || google-chrome-stable --version)
+          else
+            playwright install --with-deps chrome
+          fi
 
       - name: Run monitor
         env:
