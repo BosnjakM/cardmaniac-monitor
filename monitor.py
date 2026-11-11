@@ -192,6 +192,27 @@ BRACK_LIVE_URLS = [
 # Fewer products than this across all pages = probably blocked/broken page.
 BRACK_LIVE_MIN_PRODUCTS = 5
 
+# --- Orell Füssli / Thalia: new Pokémon listings (search + EANs not in the shop yet) ---
+ORELL_SEEN = ROOT / "seen_orell.json"
+ORELL_SEARCH_URL = "https://www.orellfuessli.ch/suche?sq=pokemon+sammelkarten"
+# These are not in the online search until Orell creates the article. Poll by EAN.
+ORELL_WATCH_EANS = [
+    ("0196214155343", "30 Jahre Ultra-Premium-Kollektion Tag (DE)"),
+    ("0196214155404", "30 Jahre Ultra-Premium-Kollektion Nacht (DE)"),
+    ("0196214155329", "30th Celebration Ultra-Premium Collection Day (EN)"),
+    ("0196214146983", "30 Jahre Tin #1 Tag (DE)"),
+]
+ORELL_MIN_PRODUCTS = 8
+ORELL_PRIORITY_KEYWORDS = [
+    "30 jahre",
+    "30th",
+    "30-jahre",
+    "ultra-premium",
+    "ultra premium",
+    "delta",
+    "ditto",
+]
+
 # --- Harry Potter Studio Tour (WB London) — watch timeslots for a fixed date ---
 HP_STUDIO_SEEN = ROOT / "seen_hp_studio.json"
 HP_STUDIO_BOOK_URL = (
@@ -2435,6 +2456,179 @@ def check_hp_studio() -> None:
     _hp_studio_save_state(session, open_ids, initialized=True)
 
 
+# ----- Orell Füssli / Thalia -----
+
+
+def _orell_is_pokemon(title: str) -> bool:
+    folded = html_lib.unescape(title).casefold()
+    return "pokémon" in folded or "pokemon" in folded or "pkm" in folded
+
+
+def _orell_parse_search(page_html: str) -> list[dict]:
+    items: list[dict] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"<dl-product\s+([^>]+)>", page_html):
+        attrs = dict(re.findall(r'([\w-]+)="([^"]*)"', match.group(1)))
+        art = attrs.get("product-id") or ""
+        name = html_lib.unescape(attrs.get("name") or "").strip()
+        if not art.startswith("A") or not name or art in seen:
+            continue
+        if not _orell_is_pokemon(name):
+            continue
+        seen.add(art)
+        items.append(
+            {
+                "id": art,
+                "title": name,
+                "url": f"https://www.orellfuessli.ch/shop/home/artikeldetails/{art}",
+                "price": attrs.get("product-price") or attrs.get("price"),
+                "avail": attrs.get("product-avail") or "",
+            }
+        )
+    return items
+
+
+def _orell_load_state() -> dict:
+    if not ORELL_SEEN.exists():
+        return {"initialized": False, "product_ids": []}
+    try:
+        raw = json.loads(ORELL_SEEN.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {"initialized": False, "product_ids": []}
+    return {
+        "initialized": bool(raw.get("initialized")),
+        "product_ids": [str(x) for x in raw.get("product_ids", [])],
+    }
+
+
+def _orell_save_state(product_ids: set[str]) -> None:
+    ORELL_SEEN.write_text(
+        json.dumps(
+            {
+                "initialized": True,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "product_ids": sorted(product_ids),
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _orell_product_from_page(page_html: str, page_url: str, fallback_title: str) -> dict | None:
+    if "Sicherheits-Check" in page_html:
+        raise RuntimeError("Orell Füssli Sicherheits-Check")
+    match = re.search(r"artikeldetails/(A\d+)", page_url)
+    if not match:
+        return None
+    art = match.group(1)
+    title_match = re.search(r'produkttitel="([^"]+)"', page_html)
+    title = html_lib.unescape(title_match.group(1) if title_match else fallback_title)
+    price_match = re.search(r'product-price="([0-9.]+)"', page_html)
+    avail_match = re.search(r'product-avail="([^"]*)"', page_html)
+    return {
+        "id": art,
+        "title": title.strip() or fallback_title,
+        "url": f"https://www.orellfuessli.ch/shop/home/artikeldetails/{art}",
+        "price": price_match.group(1) if price_match else None,
+        "avail": html_lib.unescape(avail_match.group(1)) if avail_match else "",
+    }
+
+
+def fetch_orell() -> list[dict]:
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise RuntimeError(
+            "playwright fehlt — `pip install playwright && playwright install chrome`"
+        ) from exc
+
+    with sync_playwright() as p:
+        launch_kwargs = {
+            "headless": True,
+            "args": ["--disable-blink-features=AutomationControlled"],
+        }
+        try:
+            browser = p.chromium.launch(channel="chrome", **launch_kwargs)
+        except Exception:
+            browser = p.chromium.launch(**launch_kwargs)
+        context = browser.new_context(user_agent=UA, locale="de-CH")
+        context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
+        page = context.new_page()
+        page.goto(ORELL_SEARCH_URL, wait_until="domcontentloaded", timeout=60_000)
+        items = _orell_parse_search(page.content())
+        print(f"[Orell] Suche: {len(items)} Pokémon-Produkte")
+        by_id = {it["id"]: it for it in items}
+        for ean, label in ORELL_WATCH_EANS:
+            url = f"https://www.orellfuessli.ch/shop/home/artikeldetails/EAN{ean}"
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+                found = _orell_product_from_page(page.content(), page.url, label)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[Orell] EAN {ean} nicht prüfbar: {exc}")
+                continue
+            if found is None:
+                print(f"[Orell] noch nicht gelistet: {label}")
+                continue
+            print(f"[Orell] EAN gelistet: {found['title']} ({found['id']})")
+            by_id.setdefault(found["id"], found)
+        browser.close()
+    return list(by_id.values())
+
+
+def check_orell() -> None:
+    items = fetch_orell()
+    if len(items) < ORELL_MIN_PRODUCTS:
+        raise RuntimeError(
+            f"nur {len(items)} Produkte — vermutlich blockiert, State unverändert"
+        )
+
+    state = _orell_load_state()
+    seen = set(state["product_ids"])
+    current_ids = {it["id"] for it in items}
+    new_items = [it for it in items if it["id"] not in seen]
+    new_items.sort(
+        key=lambda it: (
+            not matches_keywords(it["title"], ORELL_PRIORITY_KEYWORDS),
+            it["title"],
+        )
+    )
+
+    if not state["initialized"]:
+        _orell_save_state(current_ids)
+        print(f"[Orell] Erster Lauf: {len(current_ids)} Produkte gespeichert, keine Mail.")
+        return
+
+    if new_items:
+        top = new_items[0]
+        prio = matches_keywords(top["title"], ORELL_PRIORITY_KEYWORDS)
+        subject = f"🟢 Orell Füssli{' PRIORITÄT' if prio else ''}: {top['title']}"
+        if len(new_items) > 1:
+            subject += f" +{len(new_items) - 1} weitere"
+        lines = ["Neues bei Orell Füssli (Thalia):", ""]
+        for it in new_items:
+            price = f"CHF {it['price']}" if it.get("price") else "CHF ?"
+            avail = it.get("avail") or "neu gelistet"
+            lines.append(f"🟢 {it['title']}")
+            lines.append(f"Quelle: Orell Füssli")
+            lines.append(f"Preis: {price}")
+            lines.append(f"Status: {avail}")
+            lines.append(it["url"])
+            lines.append("")
+        print("[Orell] Alert:")
+        for it in new_items:
+            print(f"  - {it['title']}")
+        send_email(subject, "\n".join(lines))
+    else:
+        print("[Orell] Keine neuen Produkte.")
+
+    _orell_save_state(seen | current_ids)
+
+
 def main() -> None:
     try:
         check_brack_live()
@@ -2445,6 +2639,11 @@ def main() -> None:
         check_cardmaniac()
     except Exception as exc:  # noqa: BLE001
         print(f"[Cardmaniac] FEHLER: {exc}")
+
+    try:
+        check_orell()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[Orell] FEHLER: {exc}")
 
     try:
         check_cardcollectors()
