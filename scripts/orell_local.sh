@@ -4,7 +4,8 @@ set -u
 export GIT_TERMINAL_PROMPT=0
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
-ROOT="/Users/mbosnjak/Desktop/SPAM/ProgrammierAPPS/cardmaniac"
+# Desktop is blocked for background jobs. This checkout lives outside it.
+ROOT="$HOME/Library/Application Support/cardmaniac-monitor/repo"
 LOCK="/tmp/cardmaniac-orell.lock"
 VENV="$HOME/Library/Application Support/cardmaniac-monitor/py"
 cd "$ROOT" || exit 1
